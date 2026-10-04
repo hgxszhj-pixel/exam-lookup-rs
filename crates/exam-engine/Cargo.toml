@@ -1,0 +1,30 @@
+[package]
+name = "exam-engine"
+description = "题库 / 问答材料 数据引擎,借鉴 newsnow 的 source 注册表 + 间隔分档调度 + cache-first 设计"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+inventory.workspace = true
+tracing.workspace = true
+rusqlite.workspace = true
+notify = "6"
+notify-debouncer-mini = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+divan.workspace = true
+
+[[bench]]
+name = "perf"
+path = "benches/perf.rs"
+harness = false

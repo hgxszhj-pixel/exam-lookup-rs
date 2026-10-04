@@ -1,0 +1,21 @@
+[package]
+name = "exam-cli"
+description = "题库 / 问答材料 命令行工具(导出 / 校验 / 统计)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "exam-cli"
+path = "src/main.rs"
+
+[dependencies]
+exam-engine = { path = "../exam-engine" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+rusqlite.workspace = true

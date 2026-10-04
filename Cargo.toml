@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/exam-engine",
+    "crates/exam-cli",
+    "crates/exam-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["hgxszhj"]
+publish = false
+
+[workspace.dependencies]
+# serde
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+
+# error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# engine primitives
+inventory = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# logging
+tracing = "0.1"
+
+# benchmark (dev-only)
+divan = "0.1"
