@@ -10,6 +10,7 @@ pub fn SettingsPage() -> Element {
     let mut data_root = use_signal(|| current.data_root.to_string_lossy().to_string());
     let mut db_path = use_signal(|| current.db_path.to_string_lossy().to_string());
     let mut theme = use_signal(|| current.theme);
+    let mut auto_rebuild = use_signal(|| current.auto_rebuild);
     let mut last_msg = use_signal(|| Option::<String>::None);
     let mut rebuild_msg = use_signal(|| Option::<String>::None);
     let mut rebuilding = use_signal(|| false);
@@ -116,6 +117,38 @@ pub fn SettingsPage() -> Element {
                     }
                 }
             }
+            // ── Phase M:data_root 自动重建 toggle ────────────────────────
+            div {
+                style: "margin:16px 0; padding:8px 12px; border:1px solid var(--border); border-radius:6px;",
+                label {
+                    style: "display:flex; align-items:center; gap:8px; cursor:pointer;",
+                    input {
+                        r#type: "checkbox",
+                        checked: auto_rebuild(),
+                        onchange: {
+                            let state = state.clone();
+                            move |e| {
+                                let next = e.value() == "true";
+                                auto_rebuild.set(next);
+                                if next {
+                                    let _ = state.ensure_watcher();
+                                } else {
+                                    state.stop_watcher();
+                                }
+                            }
+                        },
+                    }
+                    span { "data_root 变化时自动重建索引" }
+                }
+                p {
+                    style: "margin:6px 0 0 24px; color:var(--muted); font-size:12px;",
+                    if auto_rebuild() {
+                        "已启用 — 监听 data_root 文件变化(300ms debounce)"
+                    } else {
+                        "未启用 — 需手动点「重建索引」"
+                    }
+                }
+            }
             div {
                 style: "display:flex; gap:12px; margin-top:8px;",
                 button {
@@ -127,6 +160,7 @@ pub fn SettingsPage() -> Element {
                                 theme: theme(),
                                 data_root: std::path::PathBuf::from(data_root()),
                                 db_path: std::path::PathBuf::from(db_path()),
+                                auto_rebuild: auto_rebuild(),
                             };
                             match save_settings(&new_settings) {
                                 Ok(_) => {
