@@ -20,10 +20,29 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// 失败 source 退避的初始秒数。后续 attempts 指数倍增,封顶 [`MAX_BACKOFF_SECS`]。
+///
+/// 选 5s(而不是 Interval::Test 的 1s)是希望至少跳过 5 个 tick 才重试,既给下游
+/// 留恢复时间,又不让单测时间窗口过大。`MAX_BACKOFF_SECS` 兜底防长尾 source
+/// 永久冻结(对齐 newsnow 的 `backoff_cap`)。
+const BASE_BACKOFF_SECS: i64 = 5;
+const MAX_BACKOFF_SECS: i64 = 300;
+
+/// 指数退避:`attempts` 从 1 起算 → 5, 10, 20, 40, 80, 160, 300。
+fn next_backoff_secs(attempts: u32) -> i64 {
+    let shift = attempts.saturating_sub(1).min(20); // 防 shift overflow
+    let exp = BASE_BACKOFF_SECS.saturating_mul(1i64 << shift);
+    exp.min(MAX_BACKOFF_SECS)
+}
+
 /// 单 source 的调度状态。
 struct ScheduleEntry {
     source: &'static dyn Source,
     last_run: Option<i64>,
+    /// 连续失败次数;成功后重置为 0。
+    attempts: u32,
+    /// 允许再次 `load` 的最早时间(epoch secs);`None` 表示无退避。
+    next_retry_at: Option<i64>,
 }
 
 /// 一次 tick 的结果(便于测试 + CLI 输出)。
@@ -82,6 +101,8 @@ impl Scheduler {
         self.entries.push(ScheduleEntry {
             source,
             last_run: None,
+            attempts: 0,
+            next_retry_at: None,
         });
     }
 
@@ -99,6 +120,12 @@ impl Scheduler {
     pub fn due_indices(&self, now: i64) -> Vec<usize> {
         let mut due = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
+            // 0. 退避判断(最优先):失败后未到 next_retry_at → 跳过,防雪崩
+            if let Some(retry_at) = e.next_retry_at {
+                if now < retry_at {
+                    continue;
+                }
+            }
             let cached = self
                 .cache
                 .lock()
@@ -155,6 +182,9 @@ impl Scheduler {
                         .expect("cache mutex poisoned")
                         .upsert(&entry);
                     e.last_run = Some(now);
+                    // 成功 → 清除退避,下个 tick 重新按 interval 调度
+                    e.attempts = 0;
+                    e.next_retry_at = None;
                     out.push(TickOutcome {
                         source_id: source_id.to_string(),
                         interval,
@@ -183,6 +213,9 @@ impl Scheduler {
                         .expect("cache mutex poisoned")
                         .upsert(&entry);
                     e.last_run = Some(now);
+                    // 失败 → 累加 attempts + 推 next_retry_at;后续 tick 在 due_indices 跳过
+                    e.attempts = e.attempts.saturating_add(1);
+                    e.next_retry_at = Some(now.saturating_add(next_backoff_secs(e.attempts)));
                     out.push(TickOutcome {
                         source_id: source_id.to_string(),
                         interval,
@@ -451,5 +484,149 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "stop signal should interrupt within ~600ms (elapsed {elapsed:?})"
         );
+    }
+
+    /// 失败 source 在 backoff 窗口内不应被反复 load(防雪崩,R-007 配套)。
+    ///
+    /// 场景:`CountingFailSource` 永远 Err;连续 3 次 tick(间隔 < backoff 窗口)→ `load`
+    /// 只能调 1 次(首次失败后进入退避,后续 tick 跳过)。当前实现每次 tick 都重试
+    /// (counter=3),故此测试应 FAIL 直到 backoff 落地。
+    #[test]
+    fn tick_does_not_retry_failed_source_within_backoff_window() {
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
+        let mut s = Scheduler::new(store);
+
+        // 用 AtomicUsize 计数 load 调用次数;leak source 以满足 `&'static dyn Source`
+        // (与 counting_source() 同样套路)
+        let load_count = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
+        struct CountingFailSource {
+            counter: &'static std::sync::atomic::AtomicUsize,
+        }
+        impl Source for CountingFailSource {
+            fn id(&self) -> &'static str { "fail_counted" }
+            fn display_name(&self) -> &'static str { "FailCounted" }
+            fn interval(&self) -> Interval { Interval::Test }
+            fn load(&self, _: &Path) -> crate::Result<Vec<LoadResult>> {
+                self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(EngineError::Other("simulated".into()))
+            }
+        }
+        let fail_src: &'static CountingFailSource =
+            Box::leak(Box::new(CountingFailSource { counter: load_count }));
+        s.register(fail_src);
+
+        // Tick #1: 首次失败,应触发 1 次 load
+        let t0 = now_secs();
+        s.tick(&dummy_root(), t0);
+        assert_eq!(
+            load_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first tick must trigger exactly 1 load"
+        );
+
+        // Tick #2 / #3: 在 backoff 窗口内,load_count 应保持 1
+        s.tick(&dummy_root(), t0 + 1);
+        s.tick(&dummy_root(), t0 + 2);
+
+        assert_eq!(
+            load_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "consecutive ticks within backoff window must NOT retry failed source"
+        );
+    }
+
+    /// 失败 source 退避窗口过期后应被重新尝试(不会永久冻结)。
+    #[test]
+    fn tick_retries_failed_source_after_backoff_window_expires() {
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
+        let mut s = Scheduler::new(store);
+
+        let load_count = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
+        struct CountingFailSource {
+            counter: &'static std::sync::atomic::AtomicUsize,
+        }
+        impl Source for CountingFailSource {
+            fn id(&self) -> &'static str { "fail_expire" }
+            fn display_name(&self) -> &'static str { "FailExpire" }
+            fn interval(&self) -> Interval { Interval::Test }
+            fn load(&self, _: &Path) -> crate::Result<Vec<LoadResult>> {
+                self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(EngineError::Other("simulated".into()))
+            }
+        }
+        let fail_src: &'static CountingFailSource =
+            Box::leak(Box::new(CountingFailSource { counter: load_count }));
+        s.register(fail_src);
+
+        let t0 = now_secs();
+        s.tick(&dummy_root(), t0);
+        assert_eq!(load_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 退避窗口过期后(> BASE_BACKOFF_SECS=5)再 tick → 应重新尝试
+        s.tick(&dummy_root(), t0 + 6);
+        assert_eq!(
+            load_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "tick after backoff window should retry the failed source"
+        );
+    }
+
+    /// 成功 load 立即清除退避状态(attempts 归零、next_retry_at 清空)。
+    #[test]
+    fn tick_success_clears_backoff_state() {
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
+        let mut s = Scheduler::new(store);
+
+        // 注册一个会"先失败后成功"的 source:用 AtomicBool 控制
+        let mode = Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+        struct FlakySource {
+            mode: &'static std::sync::atomic::AtomicBool,
+        }
+        impl Source for FlakySource {
+            fn id(&self) -> &'static str { "flaky" }
+            fn display_name(&self) -> &'static str { "Flaky" }
+            fn interval(&self) -> Interval { Interval::Test }
+            fn load(&self, _: &Path) -> crate::Result<Vec<LoadResult>> {
+                if self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+                    Ok(vec![LoadResult {
+                        bank_id: crate::types::BankId::new("b1"),
+                        meta: None,
+                        questions: vec![],
+                        cards: vec![],
+                    }])
+                } else {
+                    Err(EngineError::Other("flaky fail".into()))
+                }
+            }
+        }
+        let flaky: &'static FlakySource = Box::leak(Box::new(FlakySource { mode }));
+        s.register(flaky);
+
+        let t0 = now_secs();
+        s.tick(&dummy_root(), t0); // 失败 → attempts=1, next_retry_at=t0+5
+        assert_eq!(s.entries[0].attempts, 1);
+        assert!(s.entries[0].next_retry_at.is_some());
+
+        // 切到 OK 模式 + 跳到 backoff 窗口外
+        mode.store(true, std::sync::atomic::Ordering::SeqCst);
+        s.tick(&dummy_root(), t0 + 6);
+        assert_eq!(s.entries[0].attempts, 0, "success must reset attempts to 0");
+        assert!(
+            s.entries[0].next_retry_at.is_none(),
+            "success must clear next_retry_at"
+        );
+    }
+
+    /// 纯函数 `next_backoff_secs` 单测:验证指数递增 + MAX 封顶。
+    #[test]
+    fn next_backoff_secs_grows_then_caps() {
+        assert_eq!(next_backoff_secs(1), 5);
+        assert_eq!(next_backoff_secs(2), 10);
+        assert_eq!(next_backoff_secs(3), 20);
+        assert_eq!(next_backoff_secs(4), 40);
+        // 7 次失败 = 5 * 2^6 = 320,但应被 MAX_BACKOFF_SECS=300 封顶
+        assert_eq!(next_backoff_secs(7), 300);
+        // 极端 attempts(>20) 不应 overflow
+        assert_eq!(next_backoff_secs(1000), 300);
     }
 }
