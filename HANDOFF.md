@@ -23,7 +23,8 @@ F 打磨 · H SettingsPage 数据根 + 真实数据 E2E ·
 I divan 6 perf gates · I+ 主题实时预览 · I++ swatch 缩略图 ·
 I+++ notify watcher 模块 · J 首启动 UX + 快捷键 · K 三篇 doc ·
 **L 2026-10-12 audit round (3 reviewer 并行 → 12 fix steps)** ·
-**M 2026-10-12 watcher→AppState 接入(SettingsPage 自动重建 toggle + 5 步集成)**
+**M 2026-10-12 watcher→AppState 接入(SettingsPage 自动重建 toggle + 5 步集成)** ·
+**M+ 2026-10-12 sync_watcher:data_root 变化时强制重启 watcher**
 
 报表:`docs/reports/R-001..R-014` + `R-COVERAGE.md` + `R-PERF.md` + **`docs/plans/2026-10-12-audit-fix.md`** + **`docs/plans/2026-10-12-watcher-integration.md`**
 设计:`docs/architecture.md` + `docs/port-from-python.md` + `docs/engine-design.md`
@@ -86,6 +87,14 @@ crates/exam-app/src/ui/settings.rs     — 数据根 + 主题 + DB 徽章
 - `state` 在多 closure 中共享需 `.clone()`(AppState derives Clone,Arc 字段代价小)
 - `DataRootWatcher` 必须由消费线程持有(`Drop` 即停 OS watcher),不能放 handle slot
 - `mpsc::Receiver::recv_timeout` 取 `&self`,消费线程不需要 `mut watcher`
+
+## 2026-10-12 Phase M+:sync_watcher(data_root 变更时强制重启)
+
+**问题**:Phase M 启的 watcher 监听 data_root_A;用户改路径到 B,保存后旧线程仍在监听 A,事件丢失。
+**根因**:`ensure_watcher` 幂等(`is_some → no-op`),不会因为 settings 变化而重启。
+**修法**:`AppState::sync_watcher(enabled: bool)` — enabled=true 走 `stop + ensure`(强制重启),enabled=false 走 `stop`。
+**集成**:SettingsPage 保存按钮在 `state.settings = new_settings` 之后调 `state.sync_watcher(new_settings.auto_rebuild)`,保证监听路径与 settings 对齐。
+**Test**:123 = 121 + 2(sync_watcher_restarts_after_data_root_change / sync_watcher_disabled_stops_running)。
 
 ## 下次会话候选
 
