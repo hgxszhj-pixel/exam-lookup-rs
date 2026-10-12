@@ -12,7 +12,7 @@
 |---|---|
 | Crates | engine (lib) + app (bin, Dioxus) + cli (bin) |
 | Tests | **127 passed** (91 → 112 audit +9 → 121 watcher +2 → 123 watcher-restart +4 → 127 backoff,2026-10-12) |
-| Lint | cargo clippy exit 0(0 errors) |
+| Lint | cargo clippy --all-targets -- -D warnings exit 0(0 errors) |
 | Build | cargo build --workspace exit 0 |
 | 真实数据 E2E | 21 banks / 1760 Q / 1278 cards / rebuild 0.37s |
 
@@ -25,7 +25,8 @@ I+++ notify watcher 模块 · J 首启动 UX + 快捷键 · K 三篇 doc ·
 **L 2026-10-12 audit round (3 reviewer 并行 → 12 fix steps)** ·
 **M 2026-10-12 watcher→AppState 接入(SettingsPage 自动重建 toggle + 5 步集成)** ·
 **M+ 2026-10-12 sync_watcher:data_root 变化时强制重启 watcher** ·
-**N 2026-10-12 Scheduler::tick 失败 source 指数退避(防雪崩,R-007 配套)**
+**N 2026-10-12 Scheduler::tick 失败 source 指数退避(防雪崩,R-007 配套)** ·
+**O 2026-10-12 watcher.rs test 5 unused_mut 清理(clippy --all-targets 0 error)**
 
 报表:`docs/reports/R-001..R-014` + `R-COVERAGE.md` + `R-PERF.md` + **`docs/plans/2026-10-12-audit-fix.md`** + **`docs/plans/2026-10-12-watcher-integration.md`**
 设计:`docs/architecture.md` + `docs/port-from-python.md` + `docs/engine-design.md`
@@ -130,7 +131,6 @@ crates/exam-app/src/ui/settings.rs     — 数据根 + 主题 + DB 徽章
 
 1. `dioxus-ssr` 渲染 SettingsPage → HTML snap test
 2. `scripts/dump_parity.sh` 实际生成(plan §6 列项,未实现)
-3. `watcher.rs` `--all-targets` clippy 5 个 `unused_mut` 清理(纯机械,5 处删 `mut`)
 
 ## 验收命令
 
