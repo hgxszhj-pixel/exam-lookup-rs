@@ -16,7 +16,7 @@ use crate::source::{Interval, LoadResult, Source};
 #[cfg(test)]
 use crate::error::EngineError;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -54,14 +54,18 @@ impl Default for SchedulerConfig {
 }
 
 /// 调度器:持有一组 source + 一个 CacheStore。
+///
+/// 持有 `Arc<Mutex<CacheStore>>` 而非裸 `Arc<CacheStore>`:这是 Step 0.1 后的
+/// thread-safety 正确表达。`Mutex` 把跨线程访问显式化(如果未来 scheduler
+/// 多线程化),也满足 clippy `arc_with_non_send_sync` lint。
 pub struct Scheduler {
     entries: Vec<ScheduleEntry>,
-    cache: Arc<CacheStore>,
+    cache: Arc<Mutex<CacheStore>>,
     config: SchedulerConfig,
 }
 
 impl Scheduler {
-    pub fn new(cache: Arc<CacheStore>) -> Self {
+    pub fn new(cache: Arc<Mutex<CacheStore>>) -> Self {
         Self {
             entries: Vec::new(),
             cache,
@@ -95,7 +99,13 @@ impl Scheduler {
     pub fn due_indices(&self, now: i64) -> Vec<usize> {
         let mut due = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
-            let cached = self.cache.get(e.source.id()).ok().flatten();
+            let cached = self
+                .cache
+                .lock()
+                .expect("cache mutex poisoned")
+                .get(e.source.id())
+                .ok()
+                .flatten();
             // 1. 缓存判断(优先):过期 / 缺失 → 必跑
             // 2. last_run 判断(冗余保护):即使 cache 缺失但 last_run 存在 → 按 interval 算
             let cache_due = should_refresh(cached.as_ref(), e.source.interval(), now);
@@ -111,7 +121,9 @@ impl Scheduler {
     }
 
     /// 执行一次 tick:对所有 due source 调 load() + 写 cache。
+    #[tracing::instrument(skip_all, fields(data_root = %data_root.display(), now))]
     pub fn tick(&mut self, data_root: &Path, now: i64) -> Vec<TickOutcome> {
+        let started = std::time::Instant::now();
         let due = self.due_indices(now);
         let mut out = Vec::with_capacity(due.len());
         for i in due {
@@ -137,7 +149,11 @@ impl Scheduler {
                         notes: None,
                     };
                     // upsert 失败不中断(本地 cache 写失败应容忍)
-                    let _ = self.cache.upsert(&entry);
+                    let _ = self
+                        .cache
+                        .lock()
+                        .expect("cache mutex poisoned")
+                        .upsert(&entry);
                     e.last_run = Some(now);
                     out.push(TickOutcome {
                         source_id: source_id.to_string(),
@@ -161,7 +177,11 @@ impl Scheduler {
                         questions: 0,
                         notes,
                     };
-                    let _ = self.cache.upsert(&entry);
+                    let _ = self
+                        .cache
+                        .lock()
+                        .expect("cache mutex poisoned")
+                        .upsert(&entry);
                     e.last_run = Some(now);
                     out.push(TickOutcome {
                         source_id: source_id.to_string(),
@@ -175,6 +195,12 @@ impl Scheduler {
                 }
             }
         }
+        tracing::debug!(
+            due_count = out.len(),
+            error_count = out.iter().filter(|o| o.error.is_some()).count(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "scheduler tick complete"
+        );
         out
     }
 
@@ -261,7 +287,7 @@ mod tests {
 
     #[test]
     fn new_scheduler_is_empty() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let s = Scheduler::new(store);
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
@@ -269,7 +295,7 @@ mod tests {
 
     #[test]
     fn due_indices_first_run_due_for_all() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store);
         let counter = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
         s.register(counting_source("a", Interval::Test, counter));
@@ -279,7 +305,7 @@ mod tests {
 
     #[test]
     fn tick_runs_due_sources_and_writes_cache() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store.clone());
         let counter = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
         s.register(counting_source("json_banks", Interval::Test, counter));
@@ -293,14 +319,19 @@ mod tests {
         assert_eq!(outcomes[0].error, None);
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        let cached = store.get("json_banks").unwrap().unwrap();
+        let cached = store
+            .lock()
+            .expect("cache mutex poisoned")
+            .get("json_banks")
+            .unwrap()
+            .unwrap();
         assert_eq!(cached.banks, 1);
         assert_eq!(cached.status, CacheStatus::Fresh);
     }
 
     #[test]
     fn due_indices_skips_fresh_source_within_ttl() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store.clone());
         let counter = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
         s.register(counting_source("slow_source", Interval::Slow, counter));
@@ -316,28 +347,32 @@ mod tests {
 
     #[test]
     fn due_indices_due_after_ttl_elapsed() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store.clone());
         let counter = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
         s.register(counting_source("test_src", Interval::Test, counter));
 
         // 注入一个 Expired cache entry,模拟 1 小时前
-        store.upsert(&CacheEntry {
-            source_id: "test_src".into(),
-            fetched_at: now_secs() - 7200,
-            ttl_secs: 60,
-            status: CacheStatus::Expired,
-            banks: 0,
-            questions: 0,
-            notes: None,
-        }).unwrap();
+        store
+            .lock()
+            .expect("cache mutex poisoned")
+            .upsert(&CacheEntry {
+                source_id: "test_src".into(),
+                fetched_at: now_secs() - 7200,
+                ttl_secs: 60,
+                status: CacheStatus::Expired,
+                banks: 0,
+                questions: 0,
+                notes: None,
+            })
+            .unwrap();
         let due = s.due_indices(now_secs());
         assert_eq!(due.len(), 1, "expired cache should trigger refresh");
     }
 
     #[test]
     fn tick_records_error_in_cache_notes() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store.clone());
 
         // Failing source: load 返回错误
@@ -357,7 +392,12 @@ mod tests {
         assert!(outcomes[0].error.is_some());
         assert_eq!(outcomes[0].status, CacheStatus::Expired);
 
-        let cached = store.get("fail").unwrap().unwrap();
+        let cached = store
+            .lock()
+            .expect("cache mutex poisoned")
+            .get("fail")
+            .unwrap()
+            .unwrap();
         assert_eq!(cached.status, CacheStatus::Expired);
         assert!(cached.notes.unwrap().contains("simulated"));
     }
@@ -366,7 +406,7 @@ mod tests {
     /// 用 Interval::Test (1s) + run_loop_for 2500ms → 期望 ≥ 2 次触发。
     #[test]
     fn run_loop_for_fires_at_least_twice_within_2_5s() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store).with_config(SchedulerConfig {
             tick_resolution: Duration::from_millis(200),
         });
@@ -391,7 +431,7 @@ mod tests {
     /// 验证 stop 信号能中断 run_loop。
     #[test]
     fn run_loop_for_respects_stop_signal() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store);
         let counter = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
         s.register(counting_source("stoppable", Interval::Test, counter));
