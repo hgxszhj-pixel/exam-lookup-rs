@@ -121,15 +121,24 @@ crates/exam-app/src/ui/settings.rs     — 数据根 + 主题 + DB 徽章
 - `cargo clippy --all-targets -- -D warnings` 5 个 pre-existing warnings 在 `watcher.rs:78/111/136/161/185` 的 `let mut watcher`(audit round 未修,test target 专属,非本 PR 范围)
 - `1i64 << shift` 必须 `min(20)` 否则 `attempts > 64` 时 UB;saturating_sub + min 双保险
 
+## 2026-10-12 Phase Q:dump_parity.sh 实际生成(R-015)
+
+**目的**:Audit 计划 #3 — Python `qbank.py` dump vs Rust `exam-cli dump` 输出 parity 校验。
+**数据源**:`/Users/hgxszhj/x_videos-dowloads/exam-lookup`(21 banks / 1760 Q / 1278 cards)。
+
+**结果**:
+- Python:1760 questions (1 source `json_banks`,21 banks)
+- Rust:1760 questions (2 sources `json_banks` + `crawl_cards`)
+- diff:6 行 ≈ 0.00% → ✅ parity OK (≤ 1%)
+
+**唯一差异**:Rust 多 1 source key `crawl_cards: {"保密公开题-问答": {meta:null, questions:[]}}`(空 source,数据迁移未完成)。
+**根因**:Python `dump_banks.py` 只 `glob('banks/*.json')`,Rust 全 source registry 都输出。**不是 bug**,是采样范围差异。
+
+**收口**:差异来源已记录,无需修代码(改任一方都是过度工程)。Report:`docs/reports/R-015-dump-parity.md`。
+
 ## 下次会话候选
 
-1. `dioxus-ssr` 渲染 SettingsPage → HTML snap test
-2. `scripts/dump_parity.sh` 实际生成(plan §6 列项,未实现)
-3. `watcher.rs` `--all-targets` clippy 5 个 `unused_mut` 清理(纯机械,5 处删 `mut`)
-
-## 下次会话候选
-
-1. `scripts/dump_parity.sh` 实际生成(plan §6 列项,未实现)
+(空 — 全部落档,branch 可合 main)
 
 ## 验收命令
 
