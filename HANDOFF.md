@@ -27,9 +27,10 @@ I+++ notify watcher 模块 · J 首启动 UX + 快捷键 · K 三篇 doc ·
 **M+ 2026-10-12 sync_watcher:data_root 变化时强制重启 watcher** ·
 **N 2026-10-12 Scheduler::tick 失败 source 指数退避(防雪崩,R-007 配套)** ·
 **O 2026-10-12 watcher.rs test 5 unused_mut 清理(clippy --all-targets 0 error)** ·
-**P 2026-10-12 SettingsPage dioxus-ssr 结构化 render test(防 UI 回归)**
+**P 2026-10-12 SettingsPage dioxus-ssr 结构化 render test(防 UI 回归)** ·
+**Q 2026-10-12 dump_parity.sh 实际生成 — 1760 Q 0.00% diff(R-015)**
 
-报表:`docs/reports/R-001..R-014` + `R-COVERAGE.md` + `R-PERF.md` + **`docs/plans/2026-10-12-audit-fix.md`** + **`docs/plans/2026-10-12-watcher-integration.md`**
+报表:`docs/reports/R-001..R-015` + `R-COVERAGE.md` + `R-PERF.md` + **`docs/plans/2026-10-12-audit-fix.md`** + **`docs/plans/2026-10-12-watcher-integration.md`**
 设计:`docs/architecture.md` + `docs/port-from-python.md` + `docs/engine-design.md`
 
 ## 关键文件
@@ -99,9 +100,7 @@ crates/exam-app/src/ui/settings.rs     — 数据根 + 主题 + DB 徽章
 **集成**:SettingsPage 保存按钮在 `state.settings = new_settings` 之后调 `state.sync_watcher(new_settings.auto_rebuild)`,保证监听路径与 settings 对齐。
 **Test**:123 = 121 + 2(sync_watcher_restarts_after_data_root_change / sync_watcher_disabled_stops_running)。
 
-## 2026-10-12 Phase N:Scheduler::tick 失败 source 指数退避
-
-**问题**:Audit 3.4 标 NO-OP — 失败 source 当前每 tick 都重试,雪崩风险。
+## 2026-10-12 Phase N:Scheduler::tick 失败 source 指数退避**问题**:Audit 3.4 标 NO-OP — 失败 source 当前每 tick 都重试,雪崩风险。
 **修法**:`ScheduleEntry` 加 `attempts: u32` + `next_retry_at: Option<i64>`。
 - 失败 path:`attempts++` + `next_retry_at = now + next_backoff_secs(attempts)`
 - 成功 path:`attempts = 0` + `next_retry_at = None`
