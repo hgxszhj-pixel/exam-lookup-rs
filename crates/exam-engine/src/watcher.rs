@@ -43,6 +43,12 @@ pub fn watch(root: &Path, debounce: Duration) -> Result<DataRootWatcher> {
     let mut debouncer = new_debouncer(debounce, move |res: DebounceEventResult| {
         if let Ok(events) = res {
             for ev in events {
+                // Step 1.1: log OS file event at debug (per-event; high-volume risk).
+                tracing::debug!(
+                    path = %ev.path.display(),
+                    kind = ?ev.kind,
+                    "watcher event"
+                );
                 let _ = tx.send(ev);
             }
         }
@@ -69,7 +75,7 @@ mod tests {
         let target = dir.path().join("foo.json");
         std::fs::write(&target, "{}").expect("seed");
 
-        let mut watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
+        let watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
 
         // 给 watcher 注册时间(OS 异步)
         std::thread::sleep(Duration::from_millis(250));
@@ -96,5 +102,115 @@ mod tests {
             .err()
             .expect("non-dir must error");
         assert!(matches!(err, EngineError::WatcherInit(_)), "got: {err:?}");
+    }
+
+    /// Step 3.3 (2026-10-12):创建新文件触发事件
+    #[test]
+    fn fires_on_create() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
+        std::thread::sleep(Duration::from_millis(250));
+
+        // 新建文件
+        let new = dir.path().join("new.json");
+        std::fs::write(&new, "{}").expect("create");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got = false;
+        while Instant::now() < deadline {
+            if let Ok(_ev) = watcher.rx.recv_timeout(Duration::from_millis(200)) {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "watcher 在 3s 内未触发 create 事件");
+    }
+
+    /// Step 3.3:删除文件触发事件
+    #[test]
+    fn fires_on_delete() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("doomed.json");
+        std::fs::write(&target, "{}").expect("seed");
+
+        let watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
+        std::thread::sleep(Duration::from_millis(250));
+
+        std::fs::remove_file(&target).expect("delete");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got = false;
+        while Instant::now() < deadline {
+            if let Ok(_ev) = watcher.rx.recv_timeout(Duration::from_millis(200)) {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "watcher 在 3s 内未触发 delete 事件");
+    }
+
+    /// Step 3.3:递归子目录里的修改也能捕获
+    #[test]
+    fn fires_on_recursive_subdir_modify() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).expect("mkdir sub");
+        let target = sub.join("nested.json");
+        std::fs::write(&target, "{}").expect("seed");
+
+        let watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
+        std::thread::sleep(Duration::from_millis(250));
+
+        std::fs::write(&target, "{\"x\":2}").expect("modify nested");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got = false;
+        while Instant::now() < deadline {
+            if let Ok(_ev) = watcher.rx.recv_timeout(Duration::from_millis(200)) {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "watcher 在 3s 内未触发 nested modify 事件");
+    }
+
+    /// Step 3.3:快速 burst(150ms 内 5 次 modify)→ debounce 合并为 1 个事件
+    #[test]
+    fn debounces_rapid_burst() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("burst.json");
+        std::fs::write(&target, "{}").expect("seed");
+
+        // debounce 窗口 300ms,burst 应合并
+        let watcher = watch(dir.path(), Duration::from_millis(300)).expect("watch");
+        std::thread::sleep(Duration::from_millis(250));
+
+        // 150ms 内连续写 5 次
+        let burst_start = Instant::now();
+        while burst_start.elapsed() < Duration::from_millis(150) {
+            std::fs::write(&target, "burst").expect("burst write");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // 收集 burst 完后再收到的事件(1s 内应见 1 个,但不应 ≥ 5)
+        std::thread::sleep(Duration::from_millis(400));
+        let mut count = 0usize;
+        let collect_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < collect_deadline {
+            if let Ok(_ev) = watcher.rx.recv_timeout(Duration::from_millis(100)) {
+                count += 1;
+            } else {
+                // 连续 200ms 没新事件 → debounce 窗口已过,停止收集
+                if count > 0 {
+                    break;
+                }
+            }
+        }
+        // 严格说可能 1 或 2(初始 seed 也可能触发),但绝不应 ≥ 5
+        assert!(
+            count < 5,
+            "debounce 应合并 5 次 burst,实际收到 {count} 个事件"
+        );
+        assert!(count >= 1, "应至少收到 1 个事件,got {count}");
     }
 }

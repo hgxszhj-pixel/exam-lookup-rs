@@ -10,6 +10,7 @@ pub fn SettingsPage() -> Element {
     let mut data_root = use_signal(|| current.data_root.to_string_lossy().to_string());
     let mut db_path = use_signal(|| current.db_path.to_string_lossy().to_string());
     let mut theme = use_signal(|| current.theme);
+    let mut auto_rebuild = use_signal(|| current.auto_rebuild);
     let mut last_msg = use_signal(|| Option::<String>::None);
     let mut rebuild_msg = use_signal(|| Option::<String>::None);
     let mut rebuilding = use_signal(|| false);
@@ -116,6 +117,38 @@ pub fn SettingsPage() -> Element {
                     }
                 }
             }
+            // ── Phase M:data_root 自动重建 toggle ────────────────────────
+            div {
+                style: "margin:16px 0; padding:8px 12px; border:1px solid var(--border); border-radius:6px;",
+                label {
+                    style: "display:flex; align-items:center; gap:8px; cursor:pointer;",
+                    input {
+                        r#type: "checkbox",
+                        checked: auto_rebuild(),
+                        onchange: {
+                            let state = state.clone();
+                            move |e| {
+                                let next = e.value() == "true";
+                                auto_rebuild.set(next);
+                                if next {
+                                    let _ = state.ensure_watcher();
+                                } else {
+                                    state.stop_watcher();
+                                }
+                            }
+                        },
+                    }
+                    span { "data_root 变化时自动重建索引" }
+                }
+                p {
+                    style: "margin:6px 0 0 24px; color:var(--muted); font-size:12px;",
+                    if auto_rebuild() {
+                        "已启用 — 监听 data_root 文件变化(300ms debounce)"
+                    } else {
+                        "未启用 — 需手动点「重建索引」"
+                    }
+                }
+            }
             div {
                 style: "display:flex; gap:12px; margin-top:8px;",
                 button {
@@ -127,14 +160,17 @@ pub fn SettingsPage() -> Element {
                                 theme: theme(),
                                 data_root: std::path::PathBuf::from(data_root()),
                                 db_path: std::path::PathBuf::from(db_path()),
+                                auto_rebuild: auto_rebuild(),
                             };
                             match save_settings(&new_settings) {
                                 Ok(_) => {
                                     apply_theme_to_root(new_settings.theme);
                                     if let Ok(mut g) = state.settings.write() {
-                                        *g = new_settings;
+                                        *g = new_settings.clone();
                                     }
-                                    last_msg.set(Some("已保存(主题立即生效;DB 路径变更后请「重建索引」)".into()));
+                                    // Phase M+:data_root 变化时强制重启 watcher,使监听新路径
+                                    state.sync_watcher(new_settings.auto_rebuild);
+                                    last_msg.set(Some("已保存(主题立即生效;auto_rebuild 开时 data_root 变化自动重启 watcher)".into()));
                                 }
                                 Err(e) => last_msg.set(Some(e)),
                             }
@@ -182,5 +218,84 @@ pub fn SettingsPage() -> Element {
                 p { style: "margin-top:12px; color:var(--muted);", "{m}" }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ssr_tests {
+    //! Phase P:用 dioxus-ssr 渲染 SettingsPage → 关键结构 + 条件文字断言。
+    //!
+    //! 这些是**结构化**断言(不是 golden file),目标:
+    //! 1. 关键 UI 元素(title / theme select / data_root input / db_path input /
+    //!    auto_rebuild checkbox / 保存 + 重建按钮)必须存在
+    //! 2. auto_rebuild 状态切换的副标题文字("已启用" / "未启用")必须正确
+    //!
+    //! 防 Phase M / Phase I+ 后续重构误删关键结构。
+    use super::*;
+    use crate::state::AppSettings;
+    use dioxus_ssr::render;
+
+    /// 包一层组件,把 AppState 注入 Context 后渲染 SettingsPage。
+    /// 必须是 `fn(AppState) -> Element` 才能配合 `VirtualDom::new_with_props`
+    /// (Dioxus 0.7 严格约束:`VirtualDom::new` 只接无 capture 的 fn pointer)。
+    fn render_with_state(state: AppState) -> String {
+        fn harness(state: AppState) -> Element {
+            use_context_provider(|| state);
+            rsx! { SettingsPage {} }
+        }
+        let mut dom = VirtualDom::new_with_props(harness, state);
+        dom.rebuild_in_place();
+        render(&dom)
+    }
+
+    fn fixture_state(auto_rebuild: bool) -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = AppSettings {
+            data_root: dir.path().to_path_buf(),
+            db_path: dir.path().join("test.db"),
+            auto_rebuild,
+            ..Default::default()
+        };
+        AppState::bootstrap_from(settings)
+    }
+
+    #[test]
+    fn settings_page_contains_key_sections_when_disabled() {
+        let s = fixture_state(false);
+        let html = render_with_state(s);
+
+        // 关键结构
+        assert!(html.contains("设置"), "页面标题 '设置' 必须出现");
+        assert!(html.contains("data_root 题库目录"), "data_root 标签");
+        assert!(html.contains("db_path 索引文件"), "db_path 标签");
+        assert!(html.contains("data_root 变化时自动重建索引"), "auto_rebuild 卡片");
+        assert!(html.contains("保存"), "保存按钮");
+        assert!(html.contains("重建索引"), "重建按钮");
+
+        // auto_rebuild=false → 显示 "未启用"
+        assert!(
+            html.contains("未启用"),
+            "auto_rebuild=false 时必须显示 '未启用' 副标题"
+        );
+        assert!(
+            !html.contains("已启用"),
+            "auto_rebuild=false 时不应出现 '已启用'"
+        );
+    }
+
+    #[test]
+    fn settings_page_shows_enabled_text_when_auto_rebuild_on() {
+        let s = fixture_state(true);
+        let html = render_with_state(s);
+
+        assert!(
+            html.contains("已启用"),
+            "auto_rebuild=true 时必须显示 '已启用' 副标题"
+        );
+        assert!(
+            !html.contains("未启用"),
+            "auto_rebuild=true 时不应出现 '未启用'"
+        );
+        assert!(html.contains("300ms debounce"), "debounce 描述文字应展示");
     }
 }

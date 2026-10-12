@@ -10,7 +10,7 @@
 
 use crate::error::EngineError;
 use crate::types::{BankId, BankMeta, CardItem, Question};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub mod crawl_cards;
@@ -119,6 +119,42 @@ pub fn find_source(id: &str) -> Option<&'static dyn Source> {
     all_sources().into_iter().find(|s| s.id() == id)
 }
 
+/// 单 JSON 文件 size 上限(64 MiB)。
+///
+/// 防御:4 GiB banks file → 进程 OOM(Step 1.3,2026-10-12)。
+/// 当前 21 banks 总量 16 MB,64 MiB 留 4× 余量,正常题库不会触顶。
+pub const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 读 JSON 文件 + 提前 size check + 包装 IO 错误。
+///
+/// 先 `fs::metadata().len()` 拒绝超 cap,避免 `fs::read` 一次性分配过大 buffer。
+/// 写文件 / 已存在但 < cap 的常规路径走 `fs::read`,不重复 stat。
+pub fn load_json_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, EngineError> {
+    let meta = std::fs::metadata(path).map_err(|e| EngineError::io(path, e))?;
+    if meta.len() > max_bytes {
+        return Err(EngineError::schema(
+            path,
+            format!(
+                "JSON 文件过大: {} 字节,上限 {} 字节(MAX_JSON_BYTES)",
+                meta.len(),
+                max_bytes
+            ),
+        ));
+    }
+    std::fs::read(path).map_err(|e| EngineError::io(path, e))
+}
+
+/// canonicalize 一个用户提供的路径,失败包装成 `EngineError::io`。
+///
+/// Step 1.4 (2026-10-12):防止 symlink 漂移 + 路径不一致(CLI `--data-root`
+/// 与 settings.json 里写的是不同形式时,下游 cache key 错配)。
+///
+/// `std::fs::canonicalize` 在 macOS 已解析 `/var` ↔ `/private/var`,
+/// 不需要额外的 dunce 包装(那是反向 un-canonicalize 用)。
+pub fn canonicalize_path(path: &Path) -> Result<PathBuf, EngineError> {
+    std::fs::canonicalize(path).map_err(|e| EngineError::io(path, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +217,61 @@ mod tests {
         assert!(all.iter().any(|s| s.id() == "mock"));
         assert!(find_source("mock").is_some());
         assert!(find_source("nonexistent").is_none());
+    }
+
+    /// Step 1.3: 小于 cap 的文件正常读出
+    #[test]
+    fn load_json_bounded_reads_small_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("small.json");
+        std::fs::write(&p, br#"{"hello":"world"}"#).expect("write");
+        let bytes = load_json_bounded(&p, MAX_JSON_BYTES).expect("read small");
+        assert_eq!(bytes, br#"{"hello":"world"}"#);
+    }
+
+    /// Step 1.3:超过 cap 返回 Schema 错误,且不读文件
+    /// (用 `seek` 写到超 cap 大小 — 不真分配 64+ MiB heap,只在 metadata 里骗 stat)
+    #[test]
+    fn load_json_bounded_rejects_oversize() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("huge.json");
+        // 写 16 字节,但声明 cap 8 字节 — 应该被拒
+        std::fs::write(&p, b"0123456789ABCDEF").expect("write");
+        let err = load_json_bounded(&p, 8).expect_err("must error on oversize");
+        assert!(
+            matches!(err, EngineError::Schema { .. }),
+            "want Schema error, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("JSON 文件过大"), "msg: {msg}");
+        assert!(msg.contains('8'), "msg should mention cap: {msg}");
+    }
+
+    /// Step 1.3: 等于 cap 正好通过(metadata.len() > cap 才是超)
+    #[test]
+    fn load_json_bounded_accepts_exact_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("exact.json");
+        std::fs::write(&p, b"12345678").expect("write 8 bytes");
+        let bytes = load_json_bounded(&p, 8).expect("read at cap");
+        assert_eq!(bytes.len(), 8);
+    }
+
+    /// Step 1.4: 相对路径 canonicalize 成绝对路径
+    #[test]
+    fn canonicalize_path_resolves_relative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canon = canonicalize_path(dir.path()).expect("canon");
+        assert!(canon.is_absolute(), "expected absolute, got: {canon:?}");
+        assert_eq!(canon, std::fs::canonicalize(dir.path()).unwrap());
+    }
+
+    /// Step 1.4: 不存在路径 canonicalize 失败,包成 Io error
+    #[test]
+    fn canonicalize_path_rejects_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("nope");
+        let err = canonicalize_path(&p).expect_err("must error");
+        assert!(matches!(err, EngineError::Io { .. }), "got: {err:?}");
     }
 }

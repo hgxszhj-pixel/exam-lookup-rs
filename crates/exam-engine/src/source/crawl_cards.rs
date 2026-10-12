@@ -141,7 +141,8 @@ struct RawCard {
 }
 
 fn load_one_card_file(path: &Path, bank_id: BankId) -> Result<LoadResult, EngineError> {
-    let bytes = std::fs::read(path).map_err(|e| EngineError::io(path, e))?;
+    // Step 1.3: 用 `load_json_bounded` 替裸 `fs::read` — 64 MiB cap 防 OOM。
+    let bytes = crate::source::load_json_bounded(path, crate::source::MAX_JSON_BYTES)?;
     let raw: RawCardFile =
         serde_json::from_slice(&bytes).map_err(|e| EngineError::json(path, e))?;
 

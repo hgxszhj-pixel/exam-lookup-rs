@@ -49,6 +49,10 @@ pub enum MatchKind {
     Like,
 }
 
+/// Step 1.2 (2026-10-12): query length cap to prevent FTS5 DoS.
+/// 4096 bytes ≈ 1300 个 CJK 字符,远大于任何题干长度,但能拦住 5MB 攻击。
+pub const MAX_QUERY_BYTES: usize = 4096;
+
 /// 搜索查询参数。
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
@@ -78,7 +82,18 @@ impl SearchQuery {
 }
 
 /// 执行搜索。
+/// Step 1.1 (2026-10-12): tracing instrument — `skip_all` because `Connection`
+/// has no useful `Debug` impl; capture query text + limit/bank fields.
+#[tracing::instrument(skip_all, fields(query = %q.text, limit = q.limit, bank_filter = ?q.bank_filter))]
 pub fn search(conn: &Connection, q: &SearchQuery) -> Result<Vec<SearchHit>> {
+    // Step 1.2: query length cap before any FTS5 work.
+    if q.text.len() > MAX_QUERY_BYTES {
+        return Err(EngineError::other(format!(
+            "query too long: {} bytes (cap {})",
+            q.text.len(),
+            MAX_QUERY_BYTES
+        )));
+    }
     let raw_text = q.text.trim();
     if raw_text.is_empty() {
         return Ok(Vec::new());
@@ -185,7 +200,16 @@ fn try_like(conn: &Connection, q: &SearchQuery) -> Result<Vec<SearchHit>> {
 
 /// 卡片搜索(Phase G):同 question 搜索流程,但查 `card` / `card_fts`。
 /// 无 stem_exact 优化(卡片没有 nqstem),只走 FTS + LIKE 兜底。
+#[tracing::instrument(skip_all, fields(query = %q.text, limit = q.limit, bank_filter = ?q.bank_filter))]
 pub fn search_cards(conn: &Connection, q: &SearchQuery) -> Result<Vec<CardHit>> {
+    // Step 1.2: query length cap before any FTS5 work.
+    if q.text.len() > MAX_QUERY_BYTES {
+        return Err(EngineError::other(format!(
+            "query too long: {} bytes (cap {})",
+            q.text.len(),
+            MAX_QUERY_BYTES
+        )));
+    }
     let raw_text = q.text.trim();
     if raw_text.is_empty() {
         return Ok(Vec::new());
@@ -517,6 +541,40 @@ mod tests {
         // 纯 ASCII 长串 — 不被 unicode61 切,且卡片内容无此 token
         let q = SearchQuery::new("zzqxxnomatchhere").with_limit(5);
         let hits = search_cards(&conn, &q).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    /// Step 1.2 (2026-10-12) regression: oversized query must be rejected
+    /// before any FTS5 work to prevent OOM / re-tokenization DoS.
+    #[test]
+    fn search_rejects_oversized_query() {
+        let conn = fixture();
+        // 构造一个 MAX_QUERY_BYTES + 1 长度的字符串
+        let huge = "a".repeat(MAX_QUERY_BYTES + 1);
+        let q = SearchQuery::new(huge);
+        let err = search(&conn, &q).expect_err("should reject oversized query");
+        assert!(err.to_string().contains("query too long"), "got: {err}");
+    }
+
+    /// Step 1.2 (2026-10-12) regression: same cap on search_cards.
+    #[test]
+    fn search_cards_rejects_oversized_query() {
+        let conn = card_fixture();
+        let huge = "a".repeat(MAX_QUERY_BYTES + 1);
+        let q = SearchQuery::new(huge);
+        let err = search_cards(&conn, &q).expect_err("should reject oversized query");
+        assert!(err.to_string().contains("query too long"), "got: {err}");
+    }
+
+    /// Step 1.2 boundary check: exactly MAX_QUERY_BYTES must still pass
+    /// (trim of whitespace could push it slightly over, so test the bare max).
+    #[test]
+    fn search_accepts_query_at_exact_cap() {
+        let conn = fixture();
+        let at_cap = "a".repeat(MAX_QUERY_BYTES);
+        let q = SearchQuery::new(at_cap);
+        // Should not panic with "query too long"; result is empty (no match).
+        let hits = search(&conn, &q).expect("at-cap query should not error");
         assert!(hits.is_empty());
     }
 }

@@ -138,6 +138,9 @@ impl IndexBuilder {
     }
 
     /// 从所有已注册 source 重建索引(自动 truncate + populate)。
+    /// Step 1.1 (2026-10-12): instrument rebuild + emit single info log on completion
+    /// (entry span emit is enough; outcome logged at the bottom of the fn).
+    #[tracing::instrument(skip_all, fields(data_root = %data_root.display()))]
     pub fn rebuild(&mut self, data_root: &Path) -> Result<BuildStats> {
         self.init_schema()?;
         self.truncate()?;
@@ -147,10 +150,17 @@ impl IndexBuilder {
             "last_rebuild_at",
             &now_iso8601(),
         )?;
+        tracing::info!(
+            banks = stats.banks,
+            questions = stats.questions,
+            cards = stats.cards,
+            "index rebuild complete"
+        );
         Ok(stats)
     }
 
     /// 不清空,增量插入(如果重复 `id` 走 `INSERT OR REPLACE`)。
+    #[tracing::instrument(skip_all, fields(data_root = %data_root.display()))]
     pub fn populate(&mut self, data_root: &Path) -> Result<BuildStats> {
         let mut stats = BuildStats::default();
         let sources = all_sources();
@@ -510,5 +520,81 @@ mod tests {
         assert_eq!(b.stats().unwrap().questions, 1);
         b.truncate().unwrap();
         assert_eq!(b.stats().unwrap().questions, 0);
+    }
+
+    /// Quality-reviewer P1 #4 (2026-10-12):rebuild 在 data_root 存在但两个子目录都空时的行为
+    /// - JsonBanksSource 看到空 banks/ → 返回 0 banks 不报错
+    /// - CrawlCardsSource 同理
+    /// - rebuild 应成功,stats 全 0,errors 0
+    #[test]
+    fn rebuild_succeeds_on_empty_subdirs() {
+        let dir = small_tempdir();
+        std::fs::create_dir_all(dir.path().join("banks")).unwrap();
+        std::fs::create_dir_all(dir.path().join("crawl")).unwrap();
+
+        let mut b = IndexBuilder::open_in_memory().unwrap();
+        let stats = b.rebuild(dir.path()).expect("rebuild empty must succeed");
+        assert_eq!(stats.banks, 0);
+        assert_eq!(stats.questions, 0);
+        assert_eq!(stats.cards, 0);
+        assert_eq!(stats.errors, 0, "空目录不应产生 source error");
+    }
+
+    /// Quality-reviewer P1 #4:data_root 完全空(没有 banks/ 也没有 crawl/)→
+    /// JsonBanksSource 因缺 banks/ 返回 schema Err。
+    /// **当前行为**:`populate` 用 `?` 短路,rebuild 整体 fail-fast 返回 Err
+    /// (`rebuild_succeeds_on_empty_subdirs` 测的是子目录存在但为空的情况,成功路径)。
+    /// 这暴露一个潜在改进:rebuild 能否容错,逐 source 收集错误?
+    /// 当前选择 fail-fast — 与 `load()` 错误透传语义一致(避免静默丢失)。
+    #[test]
+    fn rebuild_fails_fast_when_subdir_missing() {
+        let dir = small_tempdir();
+        // 不创建任何子目录
+
+        let mut b = IndexBuilder::open_in_memory().unwrap();
+        let err = b
+            .rebuild(dir.path())
+            .expect_err("data_root 完全空 → populate 应 fail-fast");
+        assert!(
+            matches!(err, EngineError::Schema { .. }),
+            "期望 schema 错误,got: {err:?}"
+        );
+    }
+
+    /// Quality-reviewer P1 #4:JSON 文件内同 id 出现 2 次 → INSERT OR REPLACE 不应翻倍
+    /// (与 `rebuild_is_idempotent` 互补:后者跨 rebuild,本测试单文件内 in-place)
+    ///
+    /// 注意:`stats.questions` 是**输入计数**(`insert_load_result` 里 +=1),
+    /// 不是 DB 行数。DB 真实行数必须查 `b.stats().questions`。
+    /// 本测试用后者验证 REPLACE 实际生效。
+    #[test]
+    fn rebuild_handles_duplicate_ids_in_same_json() {
+        let dir = small_tempdir();
+        let banks = dir.path().join("banks");
+        std::fs::create_dir_all(&banks).unwrap();
+        std::fs::create_dir_all(dir.path().join("crawl")).unwrap();
+        // 同一 JSON 内 id="dup" 出现 2 次
+        std::fs::write(
+            banks.join("dup.json"),
+            r#"{
+                "meta":{"title":"dup"},
+                "questions":[
+                    {"id":"dup","number":1,"type":"single","question":"first","answerKeys":["A"]},
+                    {"id":"dup","number":2,"type":"single","question":"second","answerKeys":["B"]}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let mut b = IndexBuilder::open_in_memory().unwrap();
+        let stats = b.rebuild(dir.path()).expect("rebuild must succeed");
+        // stats.questions 是 input 计数(2),与 DB 行数不同
+        assert_eq!(stats.questions, 2, "stats.questions 反映输入数,不是 DB 行数");
+        // DB 真实行数:同 id REPLACE → 1 行
+        assert_eq!(
+            b.stats().unwrap().questions,
+            1,
+            "同 id REPLACE 后 DB 只剩 1 行(后者覆盖前者)"
+        );
     }
 }

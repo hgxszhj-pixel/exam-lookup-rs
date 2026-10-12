@@ -342,6 +342,51 @@ mod tests {
         assert_eq!(norm("plain"), "plain");
     }
 
+    /// Step 3.2 (2026-10-12):基本 CJK 串词间插空格(主路径)
+    #[test]
+    fn cjk_expand_inserts_space_between_cjk() {
+        assert_eq!(cjk_expand("你好世界"), "你 好 世 界");
+        assert_eq!(cjk_expand("中华人民共和国"), "中 华 人 民 共 和 国");
+        // ASCII 段保持原样,不被插空
+        assert_eq!(cjk_expand("hello"), "hello");
+        assert_eq!(cjk_expand("中a国"), "中a国");
+        // CJK Ext A (3400-4DBF) 也算
+        assert_eq!(cjk_expand("a𪀀b"), "a𪀀b");
+    }
+
+    /// Step 3.2:ideographic space (U+3000) 不是 CJK 字符,被原样保留
+    #[test]
+    fn cjk_expand_passes_through_ideographic_space() {
+        // U+3000 是空格,不是 CJK Unified — 函数不插额外空格
+        assert_eq!(cjk_expand("中　国"), "中　国");
+        assert_eq!(cjk_expand("　"), "　");
+    }
+
+    /// Step 3.2:fullwidth digits (U+FF10-19) 不在 CJK 范围,原样保留(无插空)
+    #[test]
+    fn cjk_expand_passes_through_fullwidth_digits() {
+        // ０１２ 是 fullwidth 数字,非 CJK
+        assert_eq!(cjk_expand("中０１国"), "中０１国");
+        assert_eq!(cjk_expand("Ａ１"), "Ａ１");
+    }
+
+    /// Step 3.2:halfwidth 片假名 (U+FF65-FF9F) 不在 CJK 范围,原样保留
+    #[test]
+    fn cjk_expand_passes_through_halfwidth_katakana() {
+        // ｱ = U+FF71,halfwidth 片假名 — 非 CJK
+        assert_eq!(cjk_expand("中ｱ国"), "中ｱ国");
+    }
+
+    /// Step 3.2:空串 / 纯 ASCII / 纯 CJK 边界
+    #[test]
+    fn cjk_expand_edge_cases() {
+        assert_eq!(cjk_expand(""), "");
+        assert_eq!(cjk_expand("abc"), "abc");
+        assert_eq!(cjk_expand("中"), "中");
+        // 首尾 CJK 不需要前后空格
+        assert_eq!(cjk_expand("中"), "中");
+    }
+
     #[test]
     fn norm_collapses_whitespace() {
         assert_eq!(norm("a  b\t\tc"), "a b c");

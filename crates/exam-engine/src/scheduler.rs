@@ -16,14 +16,33 @@ use crate::source::{Interval, LoadResult, Source};
 #[cfg(test)]
 use crate::error::EngineError;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// 失败 source 退避的初始秒数。后续 attempts 指数倍增,封顶 [`MAX_BACKOFF_SECS`]。
+///
+/// 选 5s(而不是 Interval::Test 的 1s)是希望至少跳过 5 个 tick 才重试,既给下游
+/// 留恢复时间,又不让单测时间窗口过大。`MAX_BACKOFF_SECS` 兜底防长尾 source
+/// 永久冻结(对齐 newsnow 的 `backoff_cap`)。
+const BASE_BACKOFF_SECS: i64 = 5;
+const MAX_BACKOFF_SECS: i64 = 300;
+
+/// 指数退避:`attempts` 从 1 起算 → 5, 10, 20, 40, 80, 160, 300。
+fn next_backoff_secs(attempts: u32) -> i64 {
+    let shift = attempts.saturating_sub(1).min(20); // 防 shift overflow
+    let exp = BASE_BACKOFF_SECS.saturating_mul(1i64 << shift);
+    exp.min(MAX_BACKOFF_SECS)
+}
 
 /// 单 source 的调度状态。
 struct ScheduleEntry {
     source: &'static dyn Source,
     last_run: Option<i64>,
+    /// 连续失败次数;成功后重置为 0。
+    attempts: u32,
+    /// 允许再次 `load` 的最早时间(epoch secs);`None` 表示无退避。
+    next_retry_at: Option<i64>,
 }
 
 /// 一次 tick 的结果(便于测试 + CLI 输出)。
@@ -54,14 +73,18 @@ impl Default for SchedulerConfig {
 }
 
 /// 调度器:持有一组 source + 一个 CacheStore。
+///
+/// 持有 `Arc<Mutex<CacheStore>>` 而非裸 `Arc<CacheStore>`:这是 Step 0.1 后的
+/// thread-safety 正确表达。`Mutex` 把跨线程访问显式化(如果未来 scheduler
+/// 多线程化),也满足 clippy `arc_with_non_send_sync` lint。
 pub struct Scheduler {
     entries: Vec<ScheduleEntry>,
-    cache: Arc<CacheStore>,
+    cache: Arc<Mutex<CacheStore>>,
     config: SchedulerConfig,
 }
 
 impl Scheduler {
-    pub fn new(cache: Arc<CacheStore>) -> Self {
+    pub fn new(cache: Arc<Mutex<CacheStore>>) -> Self {
         Self {
             entries: Vec::new(),
             cache,
@@ -78,6 +101,8 @@ impl Scheduler {
         self.entries.push(ScheduleEntry {
             source,
             last_run: None,
+            attempts: 0,
+            next_retry_at: None,
         });
     }
 
@@ -95,7 +120,19 @@ impl Scheduler {
     pub fn due_indices(&self, now: i64) -> Vec<usize> {
         let mut due = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
-            let cached = self.cache.get(e.source.id()).ok().flatten();
+            // 0. 退避判断(最优先):失败后未到 next_retry_at → 跳过,防雪崩
+            if let Some(retry_at) = e.next_retry_at {
+                if now < retry_at {
+                    continue;
+                }
+            }
+            let cached = self
+                .cache
+                .lock()
+                .expect("cache mutex poisoned")
+                .get(e.source.id())
+                .ok()
+                .flatten();
             // 1. 缓存判断(优先):过期 / 缺失 → 必跑
             // 2. last_run 判断(冗余保护):即使 cache 缺失但 last_run 存在 → 按 interval 算
             let cache_due = should_refresh(cached.as_ref(), e.source.interval(), now);
@@ -111,7 +148,9 @@ impl Scheduler {
     }
 
     /// 执行一次 tick:对所有 due source 调 load() + 写 cache。
+    #[tracing::instrument(skip_all, fields(data_root = %data_root.display(), now))]
     pub fn tick(&mut self, data_root: &Path, now: i64) -> Vec<TickOutcome> {
+        let started = std::time::Instant::now();
         let due = self.due_indices(now);
         let mut out = Vec::with_capacity(due.len());
         for i in due {
@@ -137,8 +176,15 @@ impl Scheduler {
                         notes: None,
                     };
                     // upsert 失败不中断(本地 cache 写失败应容忍)
-                    let _ = self.cache.upsert(&entry);
+                    let _ = self
+                        .cache
+                        .lock()
+                        .expect("cache mutex poisoned")
+                        .upsert(&entry);
                     e.last_run = Some(now);
+                    // 成功 → 清除退避,下个 tick 重新按 interval 调度
+                    e.attempts = 0;
+                    e.next_retry_at = None;
                     out.push(TickOutcome {
                         source_id: source_id.to_string(),
                         interval,
@@ -161,8 +207,15 @@ impl Scheduler {
                         questions: 0,
                         notes,
                     };
-                    let _ = self.cache.upsert(&entry);
+                    let _ = self
+                        .cache
+                        .lock()
+                        .expect("cache mutex poisoned")
+                        .upsert(&entry);
                     e.last_run = Some(now);
+                    // 失败 → 累加 attempts + 推 next_retry_at;后续 tick 在 due_indices 跳过
+                    e.attempts = e.attempts.saturating_add(1);
+                    e.next_retry_at = Some(now.saturating_add(next_backoff_secs(e.attempts)));
                     out.push(TickOutcome {
                         source_id: source_id.to_string(),
                         interval,
@@ -175,6 +228,12 @@ impl Scheduler {
                 }
             }
         }
+        tracing::debug!(
+            due_count = out.len(),
+            error_count = out.iter().filter(|o| o.error.is_some()).count(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "scheduler tick complete"
+        );
         out
     }
 
@@ -261,7 +320,7 @@ mod tests {
 
     #[test]
     fn new_scheduler_is_empty() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let s = Scheduler::new(store);
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
@@ -269,7 +328,7 @@ mod tests {
 
     #[test]
     fn due_indices_first_run_due_for_all() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store);
         let counter = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
         s.register(counting_source("a", Interval::Test, counter));
@@ -279,7 +338,7 @@ mod tests {
 
     #[test]
     fn tick_runs_due_sources_and_writes_cache() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store.clone());
         let counter = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
         s.register(counting_source("json_banks", Interval::Test, counter));
@@ -293,14 +352,19 @@ mod tests {
         assert_eq!(outcomes[0].error, None);
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        let cached = store.get("json_banks").unwrap().unwrap();
+        let cached = store
+            .lock()
+            .expect("cache mutex poisoned")
+            .get("json_banks")
+            .unwrap()
+            .unwrap();
         assert_eq!(cached.banks, 1);
         assert_eq!(cached.status, CacheStatus::Fresh);
     }
 
     #[test]
     fn due_indices_skips_fresh_source_within_ttl() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store.clone());
         let counter = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
         s.register(counting_source("slow_source", Interval::Slow, counter));
@@ -316,28 +380,32 @@ mod tests {
 
     #[test]
     fn due_indices_due_after_ttl_elapsed() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store.clone());
         let counter = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
         s.register(counting_source("test_src", Interval::Test, counter));
 
         // 注入一个 Expired cache entry,模拟 1 小时前
-        store.upsert(&CacheEntry {
-            source_id: "test_src".into(),
-            fetched_at: now_secs() - 7200,
-            ttl_secs: 60,
-            status: CacheStatus::Expired,
-            banks: 0,
-            questions: 0,
-            notes: None,
-        }).unwrap();
+        store
+            .lock()
+            .expect("cache mutex poisoned")
+            .upsert(&CacheEntry {
+                source_id: "test_src".into(),
+                fetched_at: now_secs() - 7200,
+                ttl_secs: 60,
+                status: CacheStatus::Expired,
+                banks: 0,
+                questions: 0,
+                notes: None,
+            })
+            .unwrap();
         let due = s.due_indices(now_secs());
         assert_eq!(due.len(), 1, "expired cache should trigger refresh");
     }
 
     #[test]
     fn tick_records_error_in_cache_notes() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store.clone());
 
         // Failing source: load 返回错误
@@ -357,7 +425,12 @@ mod tests {
         assert!(outcomes[0].error.is_some());
         assert_eq!(outcomes[0].status, CacheStatus::Expired);
 
-        let cached = store.get("fail").unwrap().unwrap();
+        let cached = store
+            .lock()
+            .expect("cache mutex poisoned")
+            .get("fail")
+            .unwrap()
+            .unwrap();
         assert_eq!(cached.status, CacheStatus::Expired);
         assert!(cached.notes.unwrap().contains("simulated"));
     }
@@ -366,7 +439,7 @@ mod tests {
     /// 用 Interval::Test (1s) + run_loop_for 2500ms → 期望 ≥ 2 次触发。
     #[test]
     fn run_loop_for_fires_at_least_twice_within_2_5s() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store).with_config(SchedulerConfig {
             tick_resolution: Duration::from_millis(200),
         });
@@ -391,7 +464,7 @@ mod tests {
     /// 验证 stop 信号能中断 run_loop。
     #[test]
     fn run_loop_for_respects_stop_signal() {
-        let store = Arc::new(CacheStore::open_in_memory().unwrap());
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
         let mut s = Scheduler::new(store);
         let counter = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
         s.register(counting_source("stoppable", Interval::Test, counter));
@@ -411,5 +484,149 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "stop signal should interrupt within ~600ms (elapsed {elapsed:?})"
         );
+    }
+
+    /// 失败 source 在 backoff 窗口内不应被反复 load(防雪崩,R-007 配套)。
+    ///
+    /// 场景:`CountingFailSource` 永远 Err;连续 3 次 tick(间隔 < backoff 窗口)→ `load`
+    /// 只能调 1 次(首次失败后进入退避,后续 tick 跳过)。当前实现每次 tick 都重试
+    /// (counter=3),故此测试应 FAIL 直到 backoff 落地。
+    #[test]
+    fn tick_does_not_retry_failed_source_within_backoff_window() {
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
+        let mut s = Scheduler::new(store);
+
+        // 用 AtomicUsize 计数 load 调用次数;leak source 以满足 `&'static dyn Source`
+        // (与 counting_source() 同样套路)
+        let load_count = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
+        struct CountingFailSource {
+            counter: &'static std::sync::atomic::AtomicUsize,
+        }
+        impl Source for CountingFailSource {
+            fn id(&self) -> &'static str { "fail_counted" }
+            fn display_name(&self) -> &'static str { "FailCounted" }
+            fn interval(&self) -> Interval { Interval::Test }
+            fn load(&self, _: &Path) -> crate::Result<Vec<LoadResult>> {
+                self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(EngineError::Other("simulated".into()))
+            }
+        }
+        let fail_src: &'static CountingFailSource =
+            Box::leak(Box::new(CountingFailSource { counter: load_count }));
+        s.register(fail_src);
+
+        // Tick #1: 首次失败,应触发 1 次 load
+        let t0 = now_secs();
+        s.tick(&dummy_root(), t0);
+        assert_eq!(
+            load_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first tick must trigger exactly 1 load"
+        );
+
+        // Tick #2 / #3: 在 backoff 窗口内,load_count 应保持 1
+        s.tick(&dummy_root(), t0 + 1);
+        s.tick(&dummy_root(), t0 + 2);
+
+        assert_eq!(
+            load_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "consecutive ticks within backoff window must NOT retry failed source"
+        );
+    }
+
+    /// 失败 source 退避窗口过期后应被重新尝试(不会永久冻结)。
+    #[test]
+    fn tick_retries_failed_source_after_backoff_window_expires() {
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
+        let mut s = Scheduler::new(store);
+
+        let load_count = Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
+        struct CountingFailSource {
+            counter: &'static std::sync::atomic::AtomicUsize,
+        }
+        impl Source for CountingFailSource {
+            fn id(&self) -> &'static str { "fail_expire" }
+            fn display_name(&self) -> &'static str { "FailExpire" }
+            fn interval(&self) -> Interval { Interval::Test }
+            fn load(&self, _: &Path) -> crate::Result<Vec<LoadResult>> {
+                self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(EngineError::Other("simulated".into()))
+            }
+        }
+        let fail_src: &'static CountingFailSource =
+            Box::leak(Box::new(CountingFailSource { counter: load_count }));
+        s.register(fail_src);
+
+        let t0 = now_secs();
+        s.tick(&dummy_root(), t0);
+        assert_eq!(load_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 退避窗口过期后(> BASE_BACKOFF_SECS=5)再 tick → 应重新尝试
+        s.tick(&dummy_root(), t0 + 6);
+        assert_eq!(
+            load_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "tick after backoff window should retry the failed source"
+        );
+    }
+
+    /// 成功 load 立即清除退避状态(attempts 归零、next_retry_at 清空)。
+    #[test]
+    fn tick_success_clears_backoff_state() {
+        let store = Arc::new(Mutex::new(CacheStore::open_in_memory().unwrap()));
+        let mut s = Scheduler::new(store);
+
+        // 注册一个会"先失败后成功"的 source:用 AtomicBool 控制
+        let mode = Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+        struct FlakySource {
+            mode: &'static std::sync::atomic::AtomicBool,
+        }
+        impl Source for FlakySource {
+            fn id(&self) -> &'static str { "flaky" }
+            fn display_name(&self) -> &'static str { "Flaky" }
+            fn interval(&self) -> Interval { Interval::Test }
+            fn load(&self, _: &Path) -> crate::Result<Vec<LoadResult>> {
+                if self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+                    Ok(vec![LoadResult {
+                        bank_id: crate::types::BankId::new("b1"),
+                        meta: None,
+                        questions: vec![],
+                        cards: vec![],
+                    }])
+                } else {
+                    Err(EngineError::Other("flaky fail".into()))
+                }
+            }
+        }
+        let flaky: &'static FlakySource = Box::leak(Box::new(FlakySource { mode }));
+        s.register(flaky);
+
+        let t0 = now_secs();
+        s.tick(&dummy_root(), t0); // 失败 → attempts=1, next_retry_at=t0+5
+        assert_eq!(s.entries[0].attempts, 1);
+        assert!(s.entries[0].next_retry_at.is_some());
+
+        // 切到 OK 模式 + 跳到 backoff 窗口外
+        mode.store(true, std::sync::atomic::Ordering::SeqCst);
+        s.tick(&dummy_root(), t0 + 6);
+        assert_eq!(s.entries[0].attempts, 0, "success must reset attempts to 0");
+        assert!(
+            s.entries[0].next_retry_at.is_none(),
+            "success must clear next_retry_at"
+        );
+    }
+
+    /// 纯函数 `next_backoff_secs` 单测:验证指数递增 + MAX 封顶。
+    #[test]
+    fn next_backoff_secs_grows_then_caps() {
+        assert_eq!(next_backoff_secs(1), 5);
+        assert_eq!(next_backoff_secs(2), 10);
+        assert_eq!(next_backoff_secs(3), 20);
+        assert_eq!(next_backoff_secs(4), 40);
+        // 7 次失败 = 5 * 2^6 = 320,但应被 MAX_BACKOFF_SECS=300 封顶
+        assert_eq!(next_backoff_secs(7), 300);
+        // 极端 attempts(>20) 不应 overflow
+        assert_eq!(next_backoff_secs(1000), 300);
     }
 }

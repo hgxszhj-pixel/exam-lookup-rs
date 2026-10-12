@@ -14,6 +14,7 @@ use exam_engine::{
     IndexBuilder, Scheduler, SearchQuery,
 };
 use std::path::{Path, PathBuf};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "exam-cli", version, about = "exam-lookup-rs 命令行工具")]
@@ -98,20 +99,26 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // Step 1.1 (2026-10-12): initialize tracing subscriber with RUST_LOG filter.
+    // `.ok()` swallows "already initialized" errors (e.g. test harnesses).
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .try_init()
+        .ok();
+
     let cli = Cli::parse();
 
     match cli.cmd {
         Cmd::Sources => list_sources(),
         Cmd::Load { source, filter } => {
-            let data_root = cli.data_root.ok_or_else(|| {
-                anyhow::anyhow!("--data-root <DIR> is required for `load`")
-            })?;
+            let data_root = resolve_data_root(&cli.data_root, "load")?;
             load_source(&source, &data_root, filter.as_deref())
         }
         Cmd::Index { out, rebuild } => {
-            let data_root = cli.data_root.ok_or_else(|| {
-                anyhow::anyhow!("--data-root <DIR> is required for `index`")
-            })?;
+            let data_root = resolve_data_root(&cli.data_root, "index")?;
             build_index(&data_root, &out, rebuild)
         }
         Cmd::Search {
@@ -122,25 +129,30 @@ fn main() -> Result<()> {
             json,
         } => run_search(&db, &query, bank.as_deref(), limit, json),
         Cmd::Dump { out } => {
-            let data_root = cli.data_root.ok_or_else(|| {
-                anyhow::anyhow!("--data-root <DIR> is required for `dump`")
-            })?;
+            let data_root = resolve_data_root(&cli.data_root, "dump")?;
             run_dump(&data_root, &out)
         }
         Cmd::Cache { db } => run_cache_list(&db),
         Cmd::Tick { cache } => {
-            let data_root = cli.data_root.ok_or_else(|| {
-                anyhow::anyhow!("--data-root <DIR> is required for `tick`")
-            })?;
+            let data_root = resolve_data_root(&cli.data_root, "tick")?;
             run_tick(&cache, &data_root)
         }
         Cmd::Run { cache, seconds } => {
-            let data_root = cli.data_root.ok_or_else(|| {
-                anyhow::anyhow!("--data-root <DIR> is required for `run`")
-            })?;
+            let data_root = resolve_data_root(&cli.data_root, "run")?;
             run_scheduler(&cache, &data_root, seconds)
         }
     }
+}
+
+/// Step 1.4: 校验 `--data-root` 存在 + canonicalize。
+///
+/// 返回绝对路径,失败立刻报错(用户输入早 fail,不下到 engine 才暴露)。
+fn resolve_data_root(opt: &Option<PathBuf>, sub: &str) -> Result<PathBuf> {
+    let p = opt
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--data-root <DIR> is required for `{sub}`"))?;
+    exam_engine::source::canonicalize_path(p)
+        .with_context(|| format!("--data-root 不可访问: {}", p.display()))
 }
 
 fn list_sources() -> Result<()> {
@@ -231,6 +243,15 @@ fn run_search(
     limit: usize,
     as_json: bool,
 ) -> Result<()> {
+    // Step 1.2: defense-in-depth query cap (engine also caps, but reject early with
+    // a clear CLI-side error so users see what changed).
+    if query.len() > exam_engine::search::MAX_QUERY_BYTES {
+        return Err(anyhow::anyhow!(
+            "query 太长:{} 字节 (上限 {})",
+            query.len(),
+            exam_engine::search::MAX_QUERY_BYTES
+        ));
+    }
     if !db.exists() {
         return Err(anyhow::anyhow!(
             "DB 不存在:{} — 先跑 `exam-cli index --data-root ...`",
@@ -363,7 +384,7 @@ fn build_scheduler(cache: &Path) -> Result<Scheduler> {
             std::fs::create_dir_all(parent).context("create cache parent dir")?;
         }
     }
-    let store = std::sync::Arc::new(CacheStore::open(cache)?);
+    let store = std::sync::Arc::new(std::sync::Mutex::new(CacheStore::open(cache)?));
     Ok(Scheduler::new(store))
 }
 

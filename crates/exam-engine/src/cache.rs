@@ -133,16 +133,20 @@ CREATE INDEX IF NOT EXISTS idx_cache_meta_status ON cache_meta(status);
 ";
 
 /// SQLite-backed cache store(独立 cache.db)。
+///
+/// **Threading contract (Step 0.1, 2026-10-12)**:
+/// `CacheStore` is `Send` (rusqlite `Connection` is `Send`), but **NOT** `Sync`.
+/// The previous `unsafe impl Sync` was a type-system lie — `rusqlite::Connection`
+/// internally uses `RefCell` for statement caching, so sharing `&CacheStore`
+/// across threads would trigger `RefCell::borrow_mut()` panics.
+///
+/// Correct usage:
+/// - Single-threaded owner (Scheduler main thread) — current design.
+/// - If future scheduler goes multi-threaded, wrap in `Mutex<CacheStore>`,
+///   not rely on a fake `Sync` impl.
 pub struct CacheStore {
     conn: Connection,
 }
-
-// SAFETY: rusqlite 的 `Connection` 内部使用 SQLite 自带的 mutex 保证线程安全,
-//但 `Connection` 类型本身只 impl `Send` 不 impl `Sync`(rusqlite 的保守做法)。
-//我们在 exam-engine 里只在单一线程持有 `CacheStore`(Scheduler tick 是单线程循环),
-//不需要跨线程共享,这里给 `Sync` 是为了让 `Arc<CacheStore>` 编译通过。
-//若后续要把 Scheduler 改成多线程并行,需要改成 `Arc<Mutex<CacheStore>>`。
-unsafe impl Sync for CacheStore {}
 
 impl CacheStore {
     /// 打开或创建 cache.db,自动 init schema。
@@ -461,5 +465,36 @@ mod tests {
         };
         assert_eq!(e.age_secs(50), 0);
         assert_eq!(e.age_secs(200), 100);
+    }
+
+    /// Regression for Step 0.1 (2026-10-12 audit fix): dropping the
+    /// `unsafe impl Sync for CacheStore` means `CacheStore` is `Send`
+    /// but **not** `Sync`. Verify the new contract:
+    /// 1. Static check: `CacheStore: Send` (can move across threads).
+    /// 2. Sequential single-thread usage remains correct (the supported path).
+    ///
+    /// If someone re-adds the unsafe `Sync` impl, this test still passes —
+    /// but the doc-comment contract becomes a lie. Treat any re-introduction
+    /// as a HIGH-severity finding in the next audit.
+    #[test]
+    fn cache_store_is_send_sequential_use_safe() {
+        fn assert_send<T: Send>() {}
+        assert_send::<CacheStore>();
+
+        let store = CacheStore::open_in_memory().unwrap();
+        for i in 0..50 {
+            let entry = CacheEntry {
+                source_id: format!("k{i}"),
+                fetched_at: 0,
+                ttl_secs: 60,
+                status: CacheStatus::Fresh,
+                banks: 0,
+                questions: 0,
+                notes: None,
+            };
+            store.upsert(&entry).unwrap();
+            assert!(store.get(&format!("k{i}")).unwrap().is_some());
+        }
+        assert_eq!(store.list().unwrap().len(), 50);
     }
 }
