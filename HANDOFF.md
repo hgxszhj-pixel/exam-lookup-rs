@@ -11,7 +11,7 @@
 | 维度 | 数值 |
 |---|---|
 | Crates | engine (lib) + app (bin, Dioxus) + cli (bin) |
-| Tests | **123 passed** (91 → 112 audit +9 → 121 watcher +2 → 123 watcher-restart,2026-10-12) |
+| Tests | **127 passed** (91 → 112 audit +9 → 121 watcher +2 → 123 watcher-restart +4 → 127 backoff,2026-10-12) |
 | Lint | cargo clippy exit 0(0 errors) |
 | Build | cargo build --workspace exit 0 |
 | 真实数据 E2E | 21 banks / 1760 Q / 1278 cards / rebuild 0.37s |
@@ -24,7 +24,8 @@ I divan 6 perf gates · I+ 主题实时预览 · I++ swatch 缩略图 ·
 I+++ notify watcher 模块 · J 首启动 UX + 快捷键 · K 三篇 doc ·
 **L 2026-10-12 audit round (3 reviewer 并行 → 12 fix steps)** ·
 **M 2026-10-12 watcher→AppState 接入(SettingsPage 自动重建 toggle + 5 步集成)** ·
-**M+ 2026-10-12 sync_watcher:data_root 变化时强制重启 watcher**
+**M+ 2026-10-12 sync_watcher:data_root 变化时强制重启 watcher** ·
+**N 2026-10-12 Scheduler::tick 失败 source 指数退避(防雪崩,R-007 配套)**
 
 报表:`docs/reports/R-001..R-014` + `R-COVERAGE.md` + `R-PERF.md` + **`docs/plans/2026-10-12-audit-fix.md`** + **`docs/plans/2026-10-12-watcher-integration.md`**
 设计:`docs/architecture.md` + `docs/port-from-python.md` + `docs/engine-design.md`
@@ -96,11 +97,40 @@ crates/exam-app/src/ui/settings.rs     — 数据根 + 主题 + DB 徽章
 **集成**:SettingsPage 保存按钮在 `state.settings = new_settings` 之后调 `state.sync_watcher(new_settings.auto_rebuild)`,保证监听路径与 settings 对齐。
 **Test**:123 = 121 + 2(sync_watcher_restarts_after_data_root_change / sync_watcher_disabled_stops_running)。
 
+## 2026-10-12 Phase N:Scheduler::tick 失败 source 指数退避
+
+**问题**:Audit 3.4 标 NO-OP — 失败 source 当前每 tick 都重试,雪崩风险。
+**修法**:`ScheduleEntry` 加 `attempts: u32` + `next_retry_at: Option<i64>`。
+- 失败 path:`attempts++` + `next_retry_at = now + next_backoff_secs(attempts)`
+- 成功 path:`attempts = 0` + `next_retry_at = None`
+- `due_indices` 顶部:`now < next_retry_at → continue` 防重试
+- backoff 序列:5, 10, 20, 40, 80, 160, 300(MAX 封顶;5s 基线覆盖 Interval::Test=1s 跳过 ≥5 tick)
+- `next_backoff_secs` 纯函数 + 单测覆盖 1/2/3/4/7/1000 attempts
+
+**Test**:127 = 123 + 4
+- `tick_does_not_retry_failed_source_within_backoff_window` — 3 tick 在窗口内,counter=1
+- `tick_retries_failed_source_after_backoff_window_expires` — t+6 后重试,counter=2
+- `tick_success_clears_backoff_state` — flaky source 转 OK 后 attempts=0
+- `next_backoff_secs_grows_then_caps` — 指数递增 + MAX 封顶 + 极端 attempts 不 overflow
+
+**Commit**:`0b59024`
+
+**踩坑**:
+- `clippy::unnecessary_cast` — `BASE_BACKOFF_SECS as i64` 多余(const 已是 i64);直接 `BASE_BACKOFF_SECS.saturating_mul(...)`
+- `cargo clippy --all-targets -- -D warnings` 5 个 pre-existing warnings 在 `watcher.rs:78/111/136/161/185` 的 `let mut watcher`(audit round 未修,test target 专属,非本 PR 范围)
+- `1i64 << shift` 必须 `min(20)` 否则 `attempts > 64` 时 UB;saturating_sub + min 双保险
+
 ## 下次会话候选
 
 1. `dioxus-ssr` 渲染 SettingsPage → HTML snap test
 2. `scripts/dump_parity.sh` 实际生成(plan §6 列项,未实现)
-3. `Scheduler::tick` backoff(3.4 NO-OP 升级,需先实现 feature 再补 TDD test)
+3. `watcher.rs` `--all-targets` clippy 5 个 `unused_mut` 清理(纯机械,5 处删 `mut`)
+
+## 下次会话候选
+
+1. `dioxus-ssr` 渲染 SettingsPage → HTML snap test
+2. `scripts/dump_parity.sh` 实际生成(plan §6 列项,未实现)
+3. `watcher.rs` `--all-targets` clippy 5 个 `unused_mut` 清理(纯机械,5 处删 `mut`)
 
 ## 验收命令
 
