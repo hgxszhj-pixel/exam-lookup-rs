@@ -346,6 +346,25 @@ impl AppState {
     pub fn is_watcher_enabled(&self) -> bool {
         self.watcher_enabled.load(Ordering::Relaxed)
     }
+
+    /// Phase M+:把 watcher 状态对齐到 `enabled` flag + 当前 settings。
+    ///
+    /// 在 SettingsPage "保存" 按钮 / 路径变更时调用,确保 watcher 监听新路径:
+    /// - `enabled=true` → `stop_watcher` + `ensure_watcher`(**总是** 强制重启,因路径可能已变)
+    /// - `enabled=false` → `stop_watcher`
+    ///
+    /// 失败仅 `tracing::warn!`,UI 仍可正常用。
+    #[allow(dead_code)] // Step M+ SettingsPage 保存按钮调
+    pub fn sync_watcher(&self, enabled: bool) {
+        if enabled {
+            self.stop_watcher();
+            if let Err(e) = self.ensure_watcher() {
+                tracing::warn!(error = %e, "sync_watcher: 启 watcher 失败");
+            }
+        } else {
+            self.stop_watcher();
+        }
+    }
 }
 
 /// Phase M:watcher 消费线程函数 — `rx.recv_timeout(500ms)` 循环,事件触发 rebuild_index。
@@ -645,5 +664,50 @@ mod tests {
         // watcher 启动失败 → slot 应仍 None(因为 ensure_watcher 返 Err 后未存 handle)
         assert!(!s.is_watcher_enabled(), "启动失败 → enabled=false");
         assert!(s.watcher.lock().unwrap().is_none(), "启动失败 → slot=None");
+    }
+
+    /// Phase M+:sync_watcher(true) 在 data_root 变化后强制重启,slot 仍 Some。
+    #[test]
+    fn sync_watcher_restarts_after_data_root_change() {
+        let dir_a = tempfile::tempdir().expect("tempdir A");
+        let dir_b = tempfile::tempdir().expect("tempdir B");
+        let s = AppState::bootstrap();
+        // 初始启 watcher → 监听 dir_a
+        {
+            let mut g = s.settings.write().expect("settings lock");
+            g.data_root = dir_a.path().to_path_buf();
+        }
+        s.ensure_watcher().expect("start with A");
+        assert!(s.watcher.lock().unwrap().is_some());
+
+        // 改 settings.data_root → dir_b
+        {
+            let mut g = s.settings.write().expect("settings lock");
+            g.data_root = dir_b.path().to_path_buf();
+        }
+
+        // sync_watcher(true) → 强制重启,新线程监听 dir_b
+        s.sync_watcher(true);
+        assert!(s.is_watcher_enabled(), "sync(true) 后 enabled=true");
+        assert!(s.watcher.lock().unwrap().is_some(), "sync(true) 后 slot 仍 Some(新 handle)");
+
+        // 清理
+        s.stop_watcher();
+    }
+
+    /// Phase M+:sync_watcher(false) 停 watcher,即使之前在跑。
+    #[test]
+    fn sync_watcher_disabled_stops_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = AppState::bootstrap();
+        {
+            let mut g = s.settings.write().expect("settings lock");
+            g.data_root = dir.path().to_path_buf();
+        }
+        s.ensure_watcher().expect("start");
+        assert!(s.is_watcher_enabled());
+        s.sync_watcher(false);
+        assert!(!s.is_watcher_enabled(), "sync(false) 后 enabled=false");
+        assert!(s.watcher.lock().unwrap().is_none());
     }
 }

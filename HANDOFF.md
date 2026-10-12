@@ -11,7 +11,7 @@
 | 维度 | 数值 |
 |---|---|
 | Crates | engine (lib) + app (bin, Dioxus) + cli (bin) |
-| Tests | **121 passed** (91 → 112 audit +9 → 121 watcher,2026-10-12) |
+| Tests | **123 passed** (91 → 112 audit +9 → 121 watcher +2 → 123 watcher-restart,2026-10-12) |
 | Lint | cargo clippy exit 0(0 errors) |
 | Build | cargo build --workspace exit 0 |
 | 真实数据 E2E | 21 banks / 1760 Q / 1278 cards / rebuild 0.37s |
@@ -92,7 +92,6 @@ crates/exam-app/src/ui/settings.rs     — 数据根 + 主题 + DB 徽章
 1. `dioxus-ssr` 渲染 SettingsPage → HTML snap test
 2. `scripts/dump_parity.sh` 实际生成(plan §6 列项,未实现)
 3. `Scheduler::tick` backoff(3.4 NO-OP 升级,需先实现 feature 再补 TDD test)
-4. Phase M 后续:data_root 变化时自动重启 watcher(目前重启需用户先关后开)
 
 ## 验收命令
 

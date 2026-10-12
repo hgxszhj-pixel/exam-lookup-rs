@@ -166,9 +166,11 @@ pub fn SettingsPage() -> Element {
                                 Ok(_) => {
                                     apply_theme_to_root(new_settings.theme);
                                     if let Ok(mut g) = state.settings.write() {
-                                        *g = new_settings;
+                                        *g = new_settings.clone();
                                     }
-                                    last_msg.set(Some("已保存(主题立即生效;DB 路径变更后请「重建索引」)".into()));
+                                    // Phase M+:data_root 变化时强制重启 watcher,使监听新路径
+                                    state.sync_watcher(new_settings.auto_rebuild);
+                                    last_msg.set(Some("已保存(主题立即生效;auto_rebuild 开时 data_root 变化自动重启 watcher)".into()));
                                 }
                                 Err(e) => last_msg.set(Some(e)),
                             }
