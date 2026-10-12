@@ -75,7 +75,7 @@ mod tests {
         let target = dir.path().join("foo.json");
         std::fs::write(&target, "{}").expect("seed");
 
-        let mut watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
+        let watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
 
         // 给 watcher 注册时间(OS 异步)
         std::thread::sleep(Duration::from_millis(250));
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn fires_on_create() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
+        let watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
         std::thread::sleep(Duration::from_millis(250));
 
         // 新建文件
@@ -133,7 +133,7 @@ mod tests {
         let target = dir.path().join("doomed.json");
         std::fs::write(&target, "{}").expect("seed");
 
-        let mut watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
+        let watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
         std::thread::sleep(Duration::from_millis(250));
 
         std::fs::remove_file(&target).expect("delete");
@@ -158,7 +158,7 @@ mod tests {
         let target = sub.join("nested.json");
         std::fs::write(&target, "{}").expect("seed");
 
-        let mut watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
+        let watcher = watch(dir.path(), Duration::from_millis(150)).expect("watch");
         std::thread::sleep(Duration::from_millis(250));
 
         std::fs::write(&target, "{\"x\":2}").expect("modify nested");
@@ -182,7 +182,7 @@ mod tests {
         std::fs::write(&target, "{}").expect("seed");
 
         // debounce 窗口 300ms,burst 应合并
-        let mut watcher = watch(dir.path(), Duration::from_millis(300)).expect("watch");
+        let watcher = watch(dir.path(), Duration::from_millis(300)).expect("watch");
         std::thread::sleep(Duration::from_millis(250));
 
         // 150ms 内连续写 5 次
