@@ -220,3 +220,82 @@ pub fn SettingsPage() -> Element {
         }
     }
 }
+
+#[cfg(test)]
+mod ssr_tests {
+    //! Phase P:用 dioxus-ssr 渲染 SettingsPage → 关键结构 + 条件文字断言。
+    //!
+    //! 这些是**结构化**断言(不是 golden file),目标:
+    //! 1. 关键 UI 元素(title / theme select / data_root input / db_path input /
+    //!    auto_rebuild checkbox / 保存 + 重建按钮)必须存在
+    //! 2. auto_rebuild 状态切换的副标题文字("已启用" / "未启用")必须正确
+    //!
+    //! 防 Phase M / Phase I+ 后续重构误删关键结构。
+    use super::*;
+    use crate::state::AppSettings;
+    use dioxus_ssr::render;
+
+    /// 包一层组件,把 AppState 注入 Context 后渲染 SettingsPage。
+    /// 必须是 `fn(AppState) -> Element` 才能配合 `VirtualDom::new_with_props`
+    /// (Dioxus 0.7 严格约束:`VirtualDom::new` 只接无 capture 的 fn pointer)。
+    fn render_with_state(state: AppState) -> String {
+        fn harness(state: AppState) -> Element {
+            use_context_provider(|| state);
+            rsx! { SettingsPage {} }
+        }
+        let mut dom = VirtualDom::new_with_props(harness, state);
+        dom.rebuild_in_place();
+        render(&dom)
+    }
+
+    fn fixture_state(auto_rebuild: bool) -> AppState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = AppSettings {
+            data_root: dir.path().to_path_buf(),
+            db_path: dir.path().join("test.db"),
+            auto_rebuild,
+            ..Default::default()
+        };
+        AppState::bootstrap_from(settings)
+    }
+
+    #[test]
+    fn settings_page_contains_key_sections_when_disabled() {
+        let s = fixture_state(false);
+        let html = render_with_state(s);
+
+        // 关键结构
+        assert!(html.contains("设置"), "页面标题 '设置' 必须出现");
+        assert!(html.contains("data_root 题库目录"), "data_root 标签");
+        assert!(html.contains("db_path 索引文件"), "db_path 标签");
+        assert!(html.contains("data_root 变化时自动重建索引"), "auto_rebuild 卡片");
+        assert!(html.contains("保存"), "保存按钮");
+        assert!(html.contains("重建索引"), "重建按钮");
+
+        // auto_rebuild=false → 显示 "未启用"
+        assert!(
+            html.contains("未启用"),
+            "auto_rebuild=false 时必须显示 '未启用' 副标题"
+        );
+        assert!(
+            !html.contains("已启用"),
+            "auto_rebuild=false 时不应出现 '已启用'"
+        );
+    }
+
+    #[test]
+    fn settings_page_shows_enabled_text_when_auto_rebuild_on() {
+        let s = fixture_state(true);
+        let html = render_with_state(s);
+
+        assert!(
+            html.contains("已启用"),
+            "auto_rebuild=true 时必须显示 '已启用' 副标题"
+        );
+        assert!(
+            !html.contains("未启用"),
+            "auto_rebuild=true 时不应出现 '未启用'"
+        );
+        assert!(html.contains("300ms debounce"), "debounce 描述文字应展示");
+    }
+}
