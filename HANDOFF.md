@@ -227,8 +227,15 @@ CI workflow commit(`git log --oneline -1`,subject 是 `ci: 加 CI workflow …`)
 create or update workflow '.github/workflows/ci.yml' without 'workflow' scope)
 ```
 
-token **缺 `workflow` scope**。GitHub 按**推的树内容**判定 → **调换 commit 顺序也躲不掉**,
-只能把 workflow 的 commit 排最后(已这么做:其余 commit 都已推上远端,远端分支顶 = 本文件所在的 commit)。
+token **缺 `workflow` scope**。GitHub 按**推的树内容**判定 → **调换 commit 顺序也躲不掉**:
+只要**要推的那个 commit 的树里**含 `.github/workflows/*.yml`,整个 push 都被拒(不是只拒那一个文件)。
+所以只有两条路:
+
+- **排到最后推**:workflow commit 之前的所有 commit 都先推完(它们的树里没有 workflow),
+  workflow commit 单独留着 —— 本轮就是这么排的;
+- **或者先补 scope**:`gh auth refresh -h github.com -s workflow` 之后,
+  workflow commit 排在哪儿都能推,不用再折腾顺序。
+
 解根因需要**人工浏览器授权**:
 
 ```bash
