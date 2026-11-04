@@ -420,15 +420,21 @@ fn insert_load_result(
         // 写入 `q`:用 **upsert** 而不是 `INSERT OR REPLACE`。
         // `INSERT OR REPLACE` = 删旧行 + 插新行 → rowid 会变 → `q_fts.rowid` 映射就断了。
         // upsert 只 UPDATE,rowid 保持不变,FTS 的 1:1 映射才成立。
-        let rowid = match tx.query_row(
+        //
+        // **为什么不用 `... RETURNING rowid`**(2026-11-04 实测,别改回去):
+        // 同样一条 upsert,加 `RETURNING rowid` 比不加慢 3~4 倍 ——
+        // 400 行 fixture 实测 22.3 ms vs 7.0 ms,整表 build 因此慢 3 倍。
+        // 贵的不是 upsert 本身(去掉 RETURNING 后 upsert 几乎免费),而是 RETURNING:
+        // 它让 SQLite 每行多走一条「物化输出行」的路。
+        // 代价不划算 —— rowid 用一次主键索引 SELECT 拿回来,几乎免费(实测 +2 ms/400 行)。
+        let q_insert = tx.execute(
             "INSERT INTO q(id, num, type, question, nq, nqstem, answer, answerText, analysis, src, chapter) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(src, id) DO UPDATE SET \
                 num = excluded.num, type = excluded.type, question = excluded.question, \
                 nq = excluded.nq, nqstem = excluded.nqstem, answer = excluded.answer, \
                 answerText = excluded.answerText, analysis = excluded.analysis, \
-                chapter = excluded.chapter \
-             RETURNING rowid",
+                chapter = excluded.chapter",
             params![
                 q.id.as_str(),
                 q.number.map(|n| n as i64),
@@ -442,13 +448,24 @@ fn insert_load_result(
                 src,
                 chapter,
             ],
+        );
+        if let Err(e) = q_insert {
+            // 行级失败:计数 + 跳过该题,不中止整个 build(P0-1)
+            *err_counter += 1;
+            tracing::warn!(id = %q.id.as_str(), error = %e, "insert q failed — 跳过该题");
+            continue;
+        }
+        // upsert 不改 rowid → 无论这次是「插入」还是「更新」,rowid 都是同一条记录的。
+        // 用主键索引查回来(PK = (src, id) → 走 `sqlite_autoindex_q_1`)。
+        let rowid = match tx.query_row(
+            "SELECT rowid FROM q WHERE src = ? AND id = ?",
+            params![src, q.id.as_str()],
             |r| r.get::<_, i64>(0),
         ) {
             Ok(rowid) => rowid,
             Err(e) => {
-                // 行级失败:计数 + 跳过该题,不中止整个 build(P0-1)
                 *err_counter += 1;
-                tracing::warn!(id = %q.id.as_str(), error = %e, "insert q failed — 跳过该题");
+                tracing::warn!(id = %q.id.as_str(), error = %e, "lookup q rowid failed — 跳过该题");
                 continue;
             }
         };
@@ -471,19 +488,28 @@ fn insert_load_result(
     // Phase G: 写入问答材料卡片到 card + card_fts
     for card in &r.cards {
         let tags = card.tags.join(",");
-        let card_rowid = match tx.query_row(
+        // 同 `q`:upsert 不带 RETURNING(见上面的性能说明),rowid 走主键索引查回。
+        let card_insert = tx.execute(
             "INSERT INTO card(id, title, body, src, tags) VALUES (?, ?, ?, ?, ?) \
              ON CONFLICT(src, id) DO UPDATE SET \
-                title = excluded.title, body = excluded.body, tags = excluded.tags \
-             RETURNING rowid",
+                title = excluded.title, body = excluded.body, tags = excluded.tags",
             params![card.id, card.title, card.body, src, tags],
+        );
+        if let Err(e) = card_insert {
+            // 行级失败:计数 + 跳过该卡片,不中止整个 build(P0-1)
+            *err_counter += 1;
+            tracing::warn!(id = %card.id, error = %e, "insert card failed — 跳过该卡片");
+            continue;
+        }
+        let card_rowid = match tx.query_row(
+            "SELECT rowid FROM card WHERE src = ? AND id = ?",
+            params![src, card.id],
             |r| r.get::<_, i64>(0),
         ) {
             Ok(rowid) => rowid,
             Err(e) => {
-                // 行级失败:计数 + 跳过该卡片,不中止整个 build(P0-1)
                 *err_counter += 1;
-                tracing::warn!(id = %card.id, error = %e, "insert card failed — 跳过该卡片");
+                tracing::warn!(id = %card.id, error = %e, "lookup card rowid failed — 跳过该卡片");
                 continue;
             }
         };
@@ -1280,6 +1306,124 @@ mod tests {
         };
         assert_eq!(q_n, 1, "q 应仍是 1 行");
         assert_eq!(fts_n, 1, "q_fts 增量写入不得重复(修复前会变 2 行)");
+    }
+
+    /// `q_fts.rowid` 必须与 `q.rowid` **严格 1:1** —— 这是 join 不扇出的结构保证。
+    ///
+    /// 2026-11-04:写入路径把 `... RETURNING rowid` 换成了「upsert + 主键索引 SELECT
+    /// rowid」(RETURNING 让 SQLite 每行慢 3~4 倍,实测 400 行 22.3 ms → 7.0 ms)。
+    /// 换掉取 rowid 的方式之后,这个不变量必须重新被钉死 —— 尤其**第二次 populate**
+    /// 走的是 UPDATE 分支,最容易悄悄错位。
+    #[test]
+    fn fts_rowid_matches_q_rowid_one_to_one() {
+        let dir = small_tempdir();
+        let banks = dir.path().join("banks");
+        std::fs::create_dir_all(&banks).unwrap();
+        std::fs::create_dir_all(dir.path().join("crawl")).unwrap();
+        std::fs::write(
+            banks.join("a.json"),
+            r#"{"meta":{"title":"A"},"questions":[
+                {"id":"q1","question":"网络安全基础","answerKeys":["A"]},
+                {"id":"q2","question":"防火墙部署","answerKeys":["B"]}
+            ]}"#,
+        )
+        .unwrap();
+
+        let mut b = IndexBuilder::open_in_memory().unwrap();
+        b.init_schema().unwrap();
+        b.populate(dir.path()).expect("first populate");
+
+        let rowids = |b: &IndexBuilder| -> Vec<(String, i64)> {
+            let conn = b.connection();
+            let mut stmt = conn.prepare("SELECT id, rowid FROM q ORDER BY id").unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        let before = rowids(&b);
+        assert_eq!(before.len(), 2, "应有 2 题");
+
+        // 第二次 populate:走 upsert 的 UPDATE 分支 —— rowid 必须**保持不变**。
+        b.populate(dir.path()).expect("second populate");
+        let after = rowids(&b);
+        assert_eq!(before, after, "upsert 不该改变 rowid(否则 q_fts 映射断裂)");
+
+        // 每条 q 都必须有且只有一条同 rowid 的 q_fts。
+        let conn = b.connection();
+        let joined: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM q JOIN q_fts ON q.rowid = q_fts.rowid",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let q_n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM q", [], |r| r.get(0))
+            .unwrap();
+        let fts_n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM q_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(joined, q_n, "每条 q 都必须有对应的 q_fts 行");
+        assert_eq!(fts_n, q_n, "q_fts 行数必须等于 q 行数");
+    }
+
+    /// upsert 的 UPDATE 分支必须真的改内容 —— 不能退化成「插不进去就跳过」。
+    ///
+    /// 这条守住 `INSERT OR IGNORE`(无 UPDATE)那类改写:它行数对、rowid 也对,
+    /// 但题干改了之后索引里还是旧文本 → 搜新词搜不到,静默错。
+    #[test]
+    fn repopulate_updates_existing_row_content() {
+        let dir = small_tempdir();
+        let banks = dir.path().join("banks");
+        std::fs::create_dir_all(&banks).unwrap();
+        std::fs::create_dir_all(dir.path().join("crawl")).unwrap();
+        let bank = banks.join("a.json");
+
+        std::fs::write(
+            &bank,
+            r#"{"meta":{"title":"A"},"questions":[{"id":"q1","question":"网络安全基础","answerKeys":["A"]}]}"#,
+        )
+        .unwrap();
+
+        let mut b = IndexBuilder::open_in_memory().unwrap();
+        b.init_schema().unwrap();
+        b.populate(dir.path()).expect("first populate");
+
+        // 同一 id,题干改了 → 第二次 populate 必须更新 FTS 索引里的文本。
+        std::fs::write(
+            &bank,
+            r#"{"meta":{"title":"A"},"questions":[{"id":"q1","question":"量子加密通信","answerKeys":["A"]}]}"#,
+        )
+        .unwrap();
+        b.populate(dir.path()).expect("second populate");
+
+        let conn = b.connection();
+        let stem: String = conn
+            .query_row("SELECT question FROM q WHERE id = 'q1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stem, "量子加密通信", "q 表内容必须被更新");
+
+        // FTS 侧也必须换成新文本(查新词能命中、旧词查不到)。
+        // 注意:CJK 在 FTS 里是**按字**存的(`cjk_expand`),所以查询也得按字 ——
+        // 引擎侧 `build_fts_term` 就是把 CJK 拆成单字 token 再 OR-join。
+        let new_hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM q_fts WHERE q_fts MATCH '\"量\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let old_hit: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM q_fts WHERE q_fts MATCH '\"网\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_hit, 1, "FTS 索引里应是新题干");
+        assert_eq!(old_hit, 0, "旧题干不该还留在 FTS 索引里");
     }
 
     // ================ P2-3:DB 迁移路径 ================
