@@ -228,7 +228,7 @@ create or update workflow '.github/workflows/ci.yml' without 'workflow' scope)
 ```
 
 token **缺 `workflow` scope**。GitHub 按**推的树内容**判定 → **调换 commit 顺序也躲不掉**,
-只能把 workflow 的 commit 排最后(已这么做:其余都推上去了,远端在 `554c80d`)。
+只能把 workflow 的 commit 排最后(已这么做:其余 commit 都已推上远端,远端分支顶 = 本文件所在的 commit)。
 解根因需要**人工浏览器授权**:
 
 ```bash
