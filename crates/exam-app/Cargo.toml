@@ -21,6 +21,10 @@ dioxus-router-macro = "0.7.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# async 通道(把后台线程的结果送回 UI 线程)
+# P1-4:重建索引搬到后台 OS 线程后,需要一个 async 通道把结果交回 UI 线程更新 signal
+futures-channel = "0.3"
+
 # error
 anyhow = { workspace = true }
 

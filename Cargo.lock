@@ -1472,6 +1472,7 @@ dependencies = [
  "dioxus-ssr",
  "dirs 5.0.1",
  "exam-engine",
+ "futures-channel",
  "rusqlite",
  "serde",
  "serde_json",
