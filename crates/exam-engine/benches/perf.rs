@@ -14,12 +14,10 @@ use std::fs;
 use std::path::Path;
 
 use divan::Bencher;
-use exam_engine::source::LoadResult;
 use exam_engine::source::crawl_cards::CrawlCardsSource;
 use exam_engine::source::json_banks::JsonBanksSource;
-use exam_engine::{
-    IndexBuilder, SearchQuery, Source, open_readonly, search, search_cards,
-};
+use exam_engine::source::LoadResult;
+use exam_engine::{open_readonly, search, search_cards, IndexBuilder, SearchQuery, Source};
 use tempfile::TempDir;
 
 // -------- fixture builder --------
@@ -81,11 +79,14 @@ impl Fixture {
     fn new() -> Self {
         let tmp: &'static TempDir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let root: &'static Path = Box::leak(tmp.path().to_path_buf().into_boxed_path());
-        let db_path: &'static Path =
-            Box::leak(root.join("index.sqlite").into_boxed_path());
+        let db_path: &'static Path = Box::leak(root.join("index.sqlite").into_boxed_path());
         write_bank_json(root);
         write_crawl_json(root);
-        Self { root, db_path, _tmp: tmp }
+        Self {
+            root,
+            db_path,
+            _tmp: tmp,
+        }
     }
 }
 
@@ -150,7 +151,7 @@ fn load_json_banks(bencher: Bencher) {
     let fx = Fixture::new();
     bencher.bench(|| {
         let src = JsonBanksSource;
-        let results: Vec<LoadResult> = src.load(fx.root).unwrap();
+        let results: Vec<LoadResult> = src.load(fx.root).unwrap().results;
         divan::black_box(results)
     });
 }
@@ -160,7 +161,7 @@ fn load_crawl_cards(bencher: Bencher) {
     let fx = Fixture::new();
     bencher.bench(|| {
         let src = CrawlCardsSource;
-        let results: Vec<LoadResult> = src.load(fx.root).unwrap();
+        let results: Vec<LoadResult> = src.load(fx.root).unwrap().results;
         divan::black_box(results)
     });
 }

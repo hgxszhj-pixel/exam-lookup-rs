@@ -16,20 +16,18 @@ pub mod index;
 pub mod parse;
 pub mod scheduler;
 pub mod search;
+pub mod source;
 pub mod types;
 pub mod watcher;
-pub mod source;
 
-pub use cache::{CacheEntry, CacheStatus, CacheStore, compute_status, now_secs, should_refresh};
+pub use cache::{compute_status, now_secs, should_refresh, CacheEntry, CacheStatus, CacheStore};
 pub use error::{EngineError, Result};
-pub use index::{BuildStats, IndexBuilder, build_with_source, open_readonly};
+pub use index::{build_with_source, open_readonly, BuildStats, IndexBuilder};
 pub use scheduler::{Scheduler, SchedulerConfig, TickOutcome};
-pub use search::{CardHit, MatchKind, SearchHit, SearchQuery, search, search_cards};
-pub use source::{Interval, LoadResult, Source, all_sources, find_source};
-pub use types::{
-    BankId, BankMeta, BankOption, CardItem, Question, QuestionId, QuestionType,
-};
+pub use search::{search, search_cards, CardHit, MatchKind, SearchHit, SearchQuery};
+pub use source::{all_sources, find_source, Interval, LoadIssue, LoadOutcome, LoadResult, Source};
+pub use types::{BankId, BankMeta, BankOption, CardItem, Question, QuestionId, QuestionType};
 
 // 显式暴露内置 source
 pub use source::json_banks::JsonBanksSource;
-pub use watcher::{DataRootWatcher, watch};
+pub use watcher::{watch, DataRootWatcher};

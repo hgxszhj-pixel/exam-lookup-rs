@@ -11,13 +11,13 @@
 //! - `Expired` 状态强制重跑,`Fresh` 状态跳过
 //! - 不重试:load 失败 → 仍写 cache(notes 标 error),防雪崩(对齐 R-007)
 
-use crate::cache::{CacheEntry, CacheStatus, CacheStore, compute_status, should_refresh};
-use crate::source::{Interval, LoadResult, Source};
+use crate::cache::{compute_status, should_refresh, CacheEntry, CacheStatus, CacheStore};
 #[cfg(test)]
 use crate::error::EngineError;
+use crate::source::{Interval, LoadResult, Source};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// 失败 source 退避的初始秒数。后续 attempts 指数倍增,封顶 [`MAX_BACKOFF_SECS`]。
@@ -163,9 +163,24 @@ impl Scheduler {
             let load_result = e.source.load(data_root);
 
             match load_result {
-                Ok(results) => {
-                    let (banks, questions) = summarize(&results);
+                Ok(outcome) => {
+                    let (banks, questions) = summarize(&outcome.results);
                     let status = compute_status(now, ttl_secs, now);
+                    // 文件级失败不致命,但要留痕(P0-1)
+                    let notes = if outcome.issues.is_empty() {
+                        None
+                    } else {
+                        Some(format!(
+                            "{} 个文件加载失败:{}",
+                            outcome.issues.len(),
+                            outcome
+                                .issues
+                                .iter()
+                                .map(|i| i.path.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    };
                     let entry = CacheEntry {
                         source_id: source_id.to_string(),
                         fetched_at: now,
@@ -173,7 +188,7 @@ impl Scheduler {
                         status,
                         banks,
                         questions,
-                        notes: None,
+                        notes,
                     };
                     // upsert 失败不中断(本地 cache 写失败应容忍)
                     let _ = self
@@ -300,17 +315,27 @@ mod tests {
     }
 
     impl Source for CountingSource {
-        fn id(&self) -> &'static str { self.id }
-        fn display_name(&self) -> &'static str { self.display }
-        fn interval(&self) -> Interval { self.interval }
-        fn load(&self, _data_root: &Path) -> crate::Result<Vec<LoadResult>> {
-            self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(vec![LoadResult {
-                bank_id: crate::types::BankId::new("b1"),
-                meta: None,
-                questions: vec![],
-                cards: vec![],
-            }])
+        fn id(&self) -> &'static str {
+            self.id
+        }
+        fn display_name(&self) -> &'static str {
+            self.display
+        }
+        fn interval(&self) -> Interval {
+            self.interval
+        }
+        fn load(&self, _data_root: &Path) -> crate::Result<crate::source::LoadOutcome> {
+            self.counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::source::LoadOutcome {
+                results: vec![LoadResult {
+                    bank_id: crate::types::BankId::new("b1"),
+                    meta: None,
+                    questions: vec![],
+                    cards: vec![],
+                }],
+                issues: vec![],
+            })
         }
     }
 
@@ -411,10 +436,16 @@ mod tests {
         // Failing source: load 返回错误
         struct FailSource;
         impl Source for FailSource {
-            fn id(&self) -> &'static str { "fail" }
-            fn display_name(&self) -> &'static str { "Fail" }
-            fn interval(&self) -> Interval { Interval::Test }
-            fn load(&self, _: &Path) -> crate::Result<Vec<LoadResult>> {
+            fn id(&self) -> &'static str {
+                "fail"
+            }
+            fn display_name(&self) -> &'static str {
+                "Fail"
+            }
+            fn interval(&self) -> Interval {
+                Interval::Test
+            }
+            fn load(&self, _: &Path) -> crate::Result<crate::source::LoadOutcome> {
                 Err(EngineError::Other("simulated io failure".into()))
             }
         }
@@ -447,11 +478,7 @@ mod tests {
         s.register(counting_source("live", Interval::Test, counter));
 
         let stop = Arc::new(AtomicBool::new(false));
-        let outcomes = s.run_loop_for(
-            &dummy_root(),
-            Duration::from_millis(2500),
-            stop.clone(),
-        );
+        let outcomes = s.run_loop_for(&dummy_root(), Duration::from_millis(2500), stop.clone());
 
         let fires = counter.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
@@ -503,16 +530,24 @@ mod tests {
             counter: &'static std::sync::atomic::AtomicUsize,
         }
         impl Source for CountingFailSource {
-            fn id(&self) -> &'static str { "fail_counted" }
-            fn display_name(&self) -> &'static str { "FailCounted" }
-            fn interval(&self) -> Interval { Interval::Test }
-            fn load(&self, _: &Path) -> crate::Result<Vec<LoadResult>> {
-                self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            fn id(&self) -> &'static str {
+                "fail_counted"
+            }
+            fn display_name(&self) -> &'static str {
+                "FailCounted"
+            }
+            fn interval(&self) -> Interval {
+                Interval::Test
+            }
+            fn load(&self, _: &Path) -> crate::Result<crate::source::LoadOutcome> {
+                self.counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(EngineError::Other("simulated".into()))
             }
         }
-        let fail_src: &'static CountingFailSource =
-            Box::leak(Box::new(CountingFailSource { counter: load_count }));
+        let fail_src: &'static CountingFailSource = Box::leak(Box::new(CountingFailSource {
+            counter: load_count,
+        }));
         s.register(fail_src);
 
         // Tick #1: 首次失败,应触发 1 次 load
@@ -546,16 +581,24 @@ mod tests {
             counter: &'static std::sync::atomic::AtomicUsize,
         }
         impl Source for CountingFailSource {
-            fn id(&self) -> &'static str { "fail_expire" }
-            fn display_name(&self) -> &'static str { "FailExpire" }
-            fn interval(&self) -> Interval { Interval::Test }
-            fn load(&self, _: &Path) -> crate::Result<Vec<LoadResult>> {
-                self.counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            fn id(&self) -> &'static str {
+                "fail_expire"
+            }
+            fn display_name(&self) -> &'static str {
+                "FailExpire"
+            }
+            fn interval(&self) -> Interval {
+                Interval::Test
+            }
+            fn load(&self, _: &Path) -> crate::Result<crate::source::LoadOutcome> {
+                self.counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(EngineError::Other("simulated".into()))
             }
         }
-        let fail_src: &'static CountingFailSource =
-            Box::leak(Box::new(CountingFailSource { counter: load_count }));
+        let fail_src: &'static CountingFailSource = Box::leak(Box::new(CountingFailSource {
+            counter: load_count,
+        }));
         s.register(fail_src);
 
         let t0 = now_secs();
@@ -583,17 +626,26 @@ mod tests {
             mode: &'static std::sync::atomic::AtomicBool,
         }
         impl Source for FlakySource {
-            fn id(&self) -> &'static str { "flaky" }
-            fn display_name(&self) -> &'static str { "Flaky" }
-            fn interval(&self) -> Interval { Interval::Test }
-            fn load(&self, _: &Path) -> crate::Result<Vec<LoadResult>> {
+            fn id(&self) -> &'static str {
+                "flaky"
+            }
+            fn display_name(&self) -> &'static str {
+                "Flaky"
+            }
+            fn interval(&self) -> Interval {
+                Interval::Test
+            }
+            fn load(&self, _: &Path) -> crate::Result<crate::source::LoadOutcome> {
                 if self.mode.load(std::sync::atomic::Ordering::SeqCst) {
-                    Ok(vec![LoadResult {
-                        bank_id: crate::types::BankId::new("b1"),
-                        meta: None,
-                        questions: vec![],
-                        cards: vec![],
-                    }])
+                    Ok(crate::source::LoadOutcome {
+                        results: vec![LoadResult {
+                            bank_id: crate::types::BankId::new("b1"),
+                            meta: None,
+                            questions: vec![],
+                            cards: vec![],
+                        }],
+                        issues: vec![],
+                    })
                 } else {
                     Err(EngineError::Other("flaky fail".into()))
                 }

@@ -16,7 +16,7 @@ use rusqlite::{params, Connection, OpenFlags, Transaction};
 
 use crate::error::{EngineError, Result};
 use crate::parse::{cjk_expand, join_answer_text, norm, stem_of};
-use crate::source::{LoadResult, Source, all_sources};
+use crate::source::{all_sources, LoadIssue, LoadResult, Source};
 
 const SCHEMA_VERSION: i32 = 2;
 
@@ -145,11 +145,7 @@ impl IndexBuilder {
         self.init_schema()?;
         self.truncate()?;
         let stats = self.populate(data_root)?;
-        upsert_meta(
-            &self.conn,
-            "last_rebuild_at",
-            &now_iso8601(),
-        )?;
+        upsert_meta(&self.conn, "last_rebuild_at", &now_iso8601())?;
         tracing::info!(
             banks = stats.banks,
             questions = stats.questions,
@@ -160,6 +156,11 @@ impl IndexBuilder {
     }
 
     /// 不清空,增量插入(如果重复 `id` 走 `INSERT OR REPLACE`)。
+    ///
+    /// 错误语义(P0-1):
+    /// - **文件级**失败(某个 bank JSON 解析不了)→ 记 `issues` + `errors`,**继续**处理其余文件
+    /// - **source 级**失败(缺 `banks/` 目录)→ 记 `issues`;只有**一个 bank 都没进来且至少一个
+    ///   source 整体失败**才算整体失败(否则「空 data_root」会被当成成功,静默产出 0 题索引)
     #[tracing::instrument(skip_all, fields(data_root = %data_root.display()))]
     pub fn populate(&mut self, data_root: &Path) -> Result<BuildStats> {
         let mut stats = BuildStats::default();
@@ -171,15 +172,73 @@ impl IndexBuilder {
             .conn
             .unchecked_transaction()
             .map_err(|e| EngineError::other(format!("begin populate tx: {e}")))?;
+        let mut source_errors: Vec<EngineError> = Vec::new();
+        let mut file_error_count: usize = 0;
         for source in sources {
-            let results = source.load(data_root)?;
-            for r in results {
-                stats.banks += 1;
-                insert_load_result(&tx, &r, &mut stats.questions, &mut stats.cards, &mut stats.errors)?;
+            match source.load(data_root) {
+                Ok(outcome) => {
+                    for issue in outcome.issues {
+                        tracing::warn!(
+                            source = %issue.source_id,
+                            path = %issue.path.display(),
+                            error = %issue.message,
+                            "source file load failed — 跳过该文件"
+                        );
+                        stats.errors += 1;
+                        file_error_count += 1;
+                        stats.issues.push(issue);
+                    }
+                    for r in outcome.results {
+                        stats.banks += 1;
+                        insert_load_result(
+                            &tx,
+                            &r,
+                            &mut stats.questions,
+                            &mut stats.cards,
+                            &mut stats.errors,
+                        )?;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        source = source.id(),
+                        path = %data_root.display(),
+                        error = %e,
+                        "source load failed — 跳过该 source"
+                    );
+                    source_errors.push(e);
+                    stats.errors += 1;
+                    stats.issues.push(LoadIssue {
+                        source_id: source.id().to_string(),
+                        path: data_root.to_path_buf(),
+                        message: source_errors
+                            .last()
+                            .map(|e| e.to_string())
+                            .unwrap_or_default(),
+                    });
+                }
             }
         }
         tx.commit()
             .map_err(|e| EngineError::other(format!("commit populate: {e}")))?;
+        // 一个 bank 都没进来 **且** 有错误 → 整体失败(不能静默产出 0 题索引)。
+        // 失败原因优先级:文件级失败(用户看得见的现象)> source 级 schema 错误。
+        if stats.banks == 0 && stats.errors > 0 {
+            if file_error_count > 0 {
+                return Err(EngineError::other(format!(
+                    "0 个 bank 入库,{file_error_count} 个文件加载失败(首个:{})",
+                    stats
+                        .issues
+                        .iter()
+                        .find(|i| !i.message.is_empty())
+                        .map(|i| i.message.as_str())
+                        .unwrap_or("(无详情)")
+                )));
+            }
+            if let Some(first) = source_errors.into_iter().next() {
+                return Err(first);
+            }
+        }
         Ok(stats)
     }
 
@@ -217,7 +276,13 @@ pub struct BuildStats {
     pub banks: usize,
     pub questions: usize,
     pub cards: usize,
+    /// 加载错误总数(文件级 + source 级 + 行级)。
+    ///
+    /// P0-1 之前这是**死字段**:行级失败时计数 +1 就 `return Err`,
+    /// 计数永远到不了调用方 —— 于是「0 错误」是假象。
     pub errors: usize,
+    /// 加载错误明细(文件级 / source 级)。
+    pub issues: Vec<LoadIssue>,
 }
 
 fn insert_load_result(
@@ -255,8 +320,10 @@ fn insert_load_result(
             ],
         );
         if let Err(e) = result {
+            // 行级失败:计数 + 跳过该题,不中止整个 build(P0-1)
             *err_counter += 1;
-            return Err(EngineError::other(format!("insert q {}: {e}", q.id)));
+            tracing::warn!(id = %q.id.as_str(), error = %e, "insert q failed — 跳过该题");
+            continue;
         }
         // 同步插入 FTS — question 与 analysis 都做 CJK 字间加空格,
         // 让 unicode61 tokenizer 按字切分,与 build_fts_term 一致
@@ -268,7 +335,8 @@ fn insert_load_result(
         );
         if let Err(e) = fts {
             *err_counter += 1;
-            return Err(EngineError::other(format!("insert fts {}: {e}", q.id)));
+            tracing::warn!(id = %q.id.as_str(), error = %e, "insert q_fts failed — 跳过该题");
+            continue;
         }
         *q_counter += 1;
     }
@@ -280,8 +348,10 @@ fn insert_load_result(
             params![card.id, card.title, card.body, src, tags],
         );
         if let Err(e) = result {
+            // 行级失败:计数 + 跳过该卡片,不中止整个 build(P0-1)
             *err_counter += 1;
-            return Err(EngineError::other(format!("insert card {}: {e}", card.id)));
+            tracing::warn!(id = %card.id, error = %e, "insert card failed — 跳过该卡片");
+            continue;
         }
         let fts_title = cjk_expand(&card.title);
         let fts_body = cjk_expand(&card.body);
@@ -291,7 +361,8 @@ fn insert_load_result(
         );
         if let Err(e) = fts {
             *err_counter += 1;
-            return Err(EngineError::other(format!("insert card_fts {}: {e}", card.id)));
+            tracing::warn!(id = %card.id, error = %e, "insert card_fts failed — 跳过该卡片");
+            continue;
         }
         *card_counter += 1;
     }
@@ -348,11 +419,27 @@ pub fn build_with_source<S: Source>(
     let tx = conn
         .unchecked_transaction()
         .map_err(|e| EngineError::other(format!("begin: {e}")))?;
-    let results = source.load(data_root)?;
+    let outcome = source.load(data_root)?;
     let mut stats = BuildStats::default();
-    for r in results {
+    for issue in outcome.issues {
+        tracing::warn!(
+            source = %issue.source_id,
+            path = %issue.path.display(),
+            error = %issue.message,
+            "source file load failed — 跳过该文件"
+        );
+        stats.errors += 1;
+        stats.issues.push(issue);
+    }
+    for r in outcome.results {
         stats.banks += 1;
-        insert_load_result(&tx, &r, &mut stats.questions, &mut stats.cards, &mut stats.errors)?;
+        insert_load_result(
+            &tx,
+            &r,
+            &mut stats.questions,
+            &mut stats.cards,
+            &mut stats.errors,
+        )?;
     }
     tx.commit()
         .map_err(|e| EngineError::other(format!("commit: {e}")))?;
@@ -376,6 +463,64 @@ mod tests {
 
     fn small_tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn populate_isolates_bad_bank_file_and_keeps_healthy_ones() {
+        // P0-1 回归:坏文件只记 issue,健康题库照常进索引。
+        // 修复前:load_one_bank 的 `?` → 整个 source Err → rebuild 整体失败,健康题库全丢。
+        let dir = small_tempdir();
+        let banks = dir.path().join("banks");
+        std::fs::create_dir_all(&banks).unwrap();
+        // crawl/ 也建出来 —— 模拟真实 data_root(缺 crawl/ 会让 crawl source 整体报错)
+        std::fs::create_dir_all(dir.path().join("crawl")).unwrap();
+        std::fs::write(
+            banks.join("good.json"),
+            r#"{
+                "meta": {"title": "健康题库"},
+                "questions": [
+                    {"id": "g-1", "question": "健康题干?", "answerKeys": ["A"], "answerText": ["对"]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(banks.join("bad.json"), "{ broken json").unwrap();
+
+        let mut b = IndexBuilder::open_in_memory().unwrap();
+        let stats = b.rebuild(dir.path()).expect("坏文件不应让整体失败");
+
+        assert_eq!(stats.banks, 1, "健康题库应入库");
+        assert_eq!(stats.questions, 1);
+        assert_eq!(stats.errors, 1, "坏文件应记 1 个错误");
+        assert_eq!(stats.issues.len(), 1);
+        assert!(
+            stats.issues[0].path.to_string_lossy().contains("bad.json"),
+            "issue 应指向坏文件: {:?}",
+            stats.issues[0]
+        );
+        // DB 行数确认真的写进去了
+        assert_eq!(b.stats().unwrap().questions, 1);
+    }
+
+    #[test]
+    fn populate_with_only_bad_banks_reports_errors_without_panicking() {
+        // 锁住宽容语义:banks/ 存在但全部文件坏 → 不 panic、错误如实上报,
+        // 不能静默变成「0 题成功」。
+        let dir = small_tempdir();
+        let banks = dir.path().join("banks");
+        std::fs::create_dir_all(&banks).unwrap();
+        std::fs::create_dir_all(dir.path().join("crawl")).unwrap();
+        std::fs::write(banks.join("bad1.json"), "{ broken").unwrap();
+        std::fs::write(banks.join("bad2.json"), "also broken").unwrap();
+
+        let mut b = IndexBuilder::open_in_memory().unwrap();
+        // 0 bank + 有错误 → 整体失败(而不是静默成功)
+        let err = b.rebuild(dir.path()).expect_err("0 题入库必须报错");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("文件加载失败"),
+            "错误信息应说明文件级失败,got: {msg}"
+        );
     }
 
     #[test]
@@ -429,7 +574,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        std::fs::write(banks.join("answers_demo.json"), r#"{"meta":{"title":"answers"},"questions":[]}"#).unwrap();
+        std::fs::write(
+            banks.join("answers_demo.json"),
+            r#"{"meta":{"title":"answers"},"questions":[]}"#,
+        )
+        .unwrap();
         std::fs::write(banks.join("ignored.json.bak"), "{}").unwrap();
 
         let mut conn = Connection::open_in_memory().unwrap();
@@ -443,11 +592,9 @@ mod tests {
         assert_eq!(count, 2);
 
         let (nq, answer): (String, String) = conn
-            .query_row(
-                "SELECT nq, answer FROM q WHERE id = 'demo-1'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT nq, answer FROM q WHERE id = 'demo-1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(answer, "A");
         assert!(nq.contains("题干"));
@@ -589,7 +736,10 @@ mod tests {
         let mut b = IndexBuilder::open_in_memory().unwrap();
         let stats = b.rebuild(dir.path()).expect("rebuild must succeed");
         // stats.questions 是 input 计数(2),与 DB 行数不同
-        assert_eq!(stats.questions, 2, "stats.questions 反映输入数,不是 DB 行数");
+        assert_eq!(
+            stats.questions, 2,
+            "stats.questions 反映输入数,不是 DB 行数"
+        );
         // DB 真实行数:同 id REPLACE → 1 行
         assert_eq!(
             b.stats().unwrap().questions,

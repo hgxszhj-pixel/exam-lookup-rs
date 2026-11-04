@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use exam_engine::index::IndexBuilder;
-use exam_engine::search::{SearchQuery, search, search_cards};
+use exam_engine::search::{search, search_cards, SearchQuery};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -57,7 +57,7 @@ fn main() {
     let samples: &[(&str, &str)] = &[
         ("ask_关键词_中文", "保密"),
         ("ask_关键词_英文", "security"),
-        ("cards_关键词",    "安全"),
+        ("cards_关键词", "安全"),
     ];
 
     let mut all_ok = true;

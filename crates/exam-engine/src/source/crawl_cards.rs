@@ -29,7 +29,7 @@
 //! 简化:用 `contains("问答") && ends_with(".json")` 匹配,排除 `*.bak`。
 
 use crate::error::EngineError;
-use crate::source::{LoadResult, Source, SourceEntry};
+use crate::source::{LoadIssue, LoadOutcome, LoadResult, Source, SourceEntry};
 use crate::types::{BankId, CardItem};
 use std::path::Path;
 
@@ -57,7 +57,7 @@ impl Source for CrawlCardsSource {
         crate::source::Interval::Slow
     }
 
-    fn load(&self, data_root: &Path) -> Result<Vec<LoadResult>, EngineError> {
+    fn load(&self, data_root: &Path) -> Result<LoadOutcome, EngineError> {
         let crawl_dir = data_root.join(SUBDIR);
         if !crawl_dir.is_dir() {
             return Err(EngineError::schema(
@@ -69,12 +69,21 @@ impl Source for CrawlCardsSource {
             ));
         }
 
-        let entries =
-            std::fs::read_dir(&crawl_dir).map_err(|e| EngineError::io(&crawl_dir, e))?;
+        let entries = std::fs::read_dir(&crawl_dir).map_err(|e| EngineError::io(&crawl_dir, e))?;
         let mut results = Vec::new();
+        let mut issues = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|e| EngineError::io(&crawl_dir, e))?;
-            let path = entry.path();
+            let path = match entry {
+                Ok(e) => e.path(),
+                Err(e) => {
+                    issues.push(LoadIssue {
+                        source_id: ID.to_string(),
+                        path: crawl_dir.clone(),
+                        message: format!("read_dir entry: {e}"),
+                    });
+                    continue;
+                }
+            };
 
             // 只处理 .json 后缀且文件名含「问答」,跳过 .bak
             let fname = match path.file_name().and_then(|s| s.to_str()) {
@@ -93,14 +102,23 @@ impl Source for CrawlCardsSource {
                 .to_string();
             let bank_id = BankId(stem);
 
-            let result = load_one_card_file(&path, bank_id)?;
-            if !result.cards.is_empty() {
-                results.push(result);
+            // 逐文件隔离(P0-1):坏文件记 issue 后 continue
+            match load_one_card_file(&path, bank_id) {
+                Ok(result) => {
+                    if !result.cards.is_empty() {
+                        results.push(result);
+                    }
+                }
+                Err(e) => issues.push(LoadIssue {
+                    source_id: ID.to_string(),
+                    path: path.clone(),
+                    message: e.to_string(),
+                }),
             }
         }
 
         results.sort_by(|a, b| a.bank_id.cmp(&b.bank_id));
-        Ok(results)
+        Ok(LoadOutcome { results, issues })
     }
 }
 
@@ -216,8 +234,7 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos();
-                let path = std::env::temp_dir()
-                    .join(format!("{}-{}-{}", prefix, pid, nanos));
+                let path = std::env::temp_dir().join(format!("{}-{}-{}", prefix, pid, nanos));
                 std::fs::create_dir_all(&path)?;
                 Ok(Self(path))
             }
@@ -271,11 +288,7 @@ mod tests {
         )
         .unwrap();
         // 3) .bak 后缀跳过
-        std::fs::write(
-            crawl.join("示例-问答.json.bak"),
-            r#"{"questions":[]}"#,
-        )
-        .unwrap();
+        std::fs::write(crawl.join("示例-问答.json.bak"), r#"{"questions":[]}"#).unwrap();
         // 4) 全空 q+a 的记录应被跳过
         std::fs::write(
             crawl.join("部分空-问答.json"),
@@ -308,7 +321,7 @@ mod tests {
     #[test]
     fn load_finds_two_banks_skips_extras() {
         let tmp = fixture_dir();
-        let results = CrawlCardsSource.load(tmp.path()).unwrap();
+        let results = CrawlCardsSource.load(tmp.path()).unwrap().results;
         assert_eq!(results.len(), 2, "示例 + 部分空");
         let names: Vec<&str> = results.iter().map(|r| r.bank_id.as_str()).collect();
         assert_eq!(names, vec!["示例-问答", "部分空-问答"]);
@@ -317,7 +330,7 @@ mod tests {
     #[test]
     fn load_parses_card_fields() {
         let tmp = fixture_dir();
-        let results = CrawlCardsSource.load(tmp.path()).unwrap();
+        let results = CrawlCardsSource.load(tmp.path()).unwrap().results;
         let bank = &results[0]; // 示例-问答
         assert_eq!(bank.questions.len(), 0, "问答 source 不产 Question");
         assert_eq!(bank.cards.len(), 2);
@@ -332,7 +345,7 @@ mod tests {
     #[test]
     fn load_skips_blank_q_and_a() {
         let tmp = fixture_dir();
-        let results = CrawlCardsSource.load(tmp.path()).unwrap();
+        let results = CrawlCardsSource.load(tmp.path()).unwrap().results;
         let bank = results
             .iter()
             .find(|r| r.bank_id.as_str() == "部分空-问答")
@@ -352,7 +365,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = CrawlCardsSource.load(tmp.path()).unwrap();
+        let results = CrawlCardsSource.load(tmp.path()).unwrap().results;
         assert_eq!(results[0].cards[0].id, "无num-问答-0");
     }
 

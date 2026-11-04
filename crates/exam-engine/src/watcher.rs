@@ -13,8 +13,8 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use notify_debouncer_mini::{new_debouncer, DebounceEventResult, DebouncedEvent, Debouncer};
 use notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_mini::{new_debouncer, DebounceEventResult, DebouncedEvent, Debouncer};
 
 use crate::error::{EngineError, Result};
 

@@ -14,7 +14,7 @@
 
 use crate::error::{EngineError, Result};
 use crate::source::Interval;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -159,9 +159,8 @@ impl CacheStore {
 
     /// 内存 cache(测试用)。
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory().map_err(|e| {
-            EngineError::schema("<in-memory cache>", e.to_string())
-        })?;
+        let conn = Connection::open_in_memory()
+            .map_err(|e| EngineError::schema("<in-memory cache>", e.to_string()))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| EngineError::schema("<in-memory schema>", e.to_string()))?;
         Ok(Self { conn })
@@ -208,7 +207,9 @@ impl CacheStore {
                     source_id: r.get(0)?,
                     fetched_at: r.get(1)?,
                     ttl_secs: r.get::<_, i64>(2)? as u64,
-                    status: CacheStatus::parse(&status_s).ok().unwrap_or(CacheStatus::Expired),
+                    status: CacheStatus::parse(&status_s)
+                        .ok()
+                        .unwrap_or(CacheStatus::Expired),
                     banks: r.get::<_, i64>(4)? as usize,
                     questions: r.get::<_, i64>(5)? as usize,
                     notes: r.get(6)?,
@@ -234,7 +235,9 @@ impl CacheStore {
                     source_id: r.get(0)?,
                     fetched_at: r.get(1)?,
                     ttl_secs: r.get::<_, i64>(2)? as u64,
-                    status: CacheStatus::parse(&status_s).ok().unwrap_or(CacheStatus::Expired),
+                    status: CacheStatus::parse(&status_s)
+                        .ok()
+                        .unwrap_or(CacheStatus::Expired),
                     banks: r.get::<_, i64>(4)? as usize,
                     questions: r.get::<_, i64>(5)? as usize,
                     notes: r.get(6)?,
@@ -371,15 +374,17 @@ mod tests {
         assert_eq!(store.get("json_banks").unwrap().unwrap(), updated);
 
         // list 排序
-        store.upsert(&CacheEntry {
-            source_id: "other".into(),
-            fetched_at: 500,
-            ttl_secs: 60,
-            status: CacheStatus::Expired,
-            banks: 1,
-            questions: 5,
-            notes: None,
-        }).unwrap();
+        store
+            .upsert(&CacheEntry {
+                source_id: "other".into(),
+                fetched_at: 500,
+                ttl_secs: 60,
+                status: CacheStatus::Expired,
+                banks: 1,
+                questions: 5,
+                notes: None,
+            })
+            .unwrap();
         let list = store.list().unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].source_id, "json_banks");
@@ -388,10 +393,7 @@ mod tests {
 
     #[test]
     fn cache_store_persists_to_disk() {
-        let tmp = std::env::temp_dir().join(format!(
-            "exam-cache-{}.db",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("exam-cache-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         let store = CacheStore::open(&tmp).unwrap();
@@ -419,24 +421,28 @@ mod tests {
     #[test]
     fn cache_store_delete_and_clear() {
         let store = CacheStore::open_in_memory().unwrap();
-        store.upsert(&CacheEntry {
-            source_id: "a".into(),
-            fetched_at: 0,
-            ttl_secs: 60,
-            status: CacheStatus::Fresh,
-            banks: 0,
-            questions: 0,
-            notes: None,
-        }).unwrap();
-        store.upsert(&CacheEntry {
-            source_id: "b".into(),
-            fetched_at: 0,
-            ttl_secs: 60,
-            status: CacheStatus::Fresh,
-            banks: 0,
-            questions: 0,
-            notes: None,
-        }).unwrap();
+        store
+            .upsert(&CacheEntry {
+                source_id: "a".into(),
+                fetched_at: 0,
+                ttl_secs: 60,
+                status: CacheStatus::Fresh,
+                banks: 0,
+                questions: 0,
+                notes: None,
+            })
+            .unwrap();
+        store
+            .upsert(&CacheEntry {
+                source_id: "b".into(),
+                fetched_at: 0,
+                ttl_secs: 60,
+                status: CacheStatus::Fresh,
+                banks: 0,
+                questions: 0,
+                notes: None,
+            })
+            .unwrap();
 
         store.delete("a").unwrap();
         assert!(store.get("a").unwrap().is_none());

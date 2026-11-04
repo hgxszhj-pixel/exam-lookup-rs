@@ -25,7 +25,7 @@
 //! 已知 quirk:若原 `id` 缺失,用 `<bank>-idx` 合成,保证 SQLite 主键不空。
 
 use crate::error::EngineError;
-use crate::source::{LoadResult, Source, SourceEntry};
+use crate::source::{LoadIssue, LoadOutcome, LoadResult, Source, SourceEntry};
 use crate::types::{BankId, BankMeta, BankOption, Question, QuestionId, QuestionType};
 use std::path::Path;
 
@@ -62,9 +62,18 @@ struct RawQuestion {
     question: String,
     #[serde(default)]
     options: Vec<RawOption>,
-    #[serde(default, rename = "answerKeys")]
+    // 宽容:标量 `"30分钟"` 也要能解析成单元素数组(P0-1)
+    #[serde(
+        default,
+        rename = "answerKeys",
+        deserialize_with = "crate::types::string_or_vec"
+    )]
     answer_keys: Vec<String>,
-    #[serde(default, rename = "answerText")]
+    #[serde(
+        default,
+        rename = "answerText",
+        deserialize_with = "crate::types::string_or_vec"
+    )]
     answer_text: Vec<String>,
     #[serde(default)]
     analysis: Option<String>,
@@ -104,7 +113,7 @@ impl Source for JsonBanksSource {
         crate::source::Interval::Slow
     }
 
-    fn load(&self, data_root: &Path) -> Result<Vec<LoadResult>, EngineError> {
+    fn load(&self, data_root: &Path) -> Result<LoadOutcome, EngineError> {
         let banks_dir = data_root.join(Self::SUBDIR);
         if !banks_dir.is_dir() {
             return Err(EngineError::schema(
@@ -119,9 +128,20 @@ impl Source for JsonBanksSource {
         let entries = std::fs::read_dir(&banks_dir).map_err(|e| EngineError::io(&banks_dir, e))?;
 
         let mut results = Vec::new();
+        let mut issues = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|e| EngineError::io(&banks_dir, e))?;
-            let path = entry.path();
+            let path = match entry {
+                Ok(e) => e.path(),
+                // 目录项读不出来 → 记 issue,继续处理其余文件
+                Err(e) => {
+                    issues.push(LoadIssue {
+                        source_id: Self::ID.to_string(),
+                        path: banks_dir.clone(),
+                        message: format!("read_dir entry: {e}"),
+                    });
+                    continue;
+                }
+            };
 
             // 只处理 .json 后缀
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
@@ -142,12 +162,20 @@ impl Source for JsonBanksSource {
                 continue;
             }
 
-            let result = load_one_bank(&path, BankId(stem))?;
-            results.push(result);
+            // 逐文件隔离(P0-1):一个坏文件记 issue 后 continue,
+            // 不能让 `?` 把整个 load() 拖垮 —— 那样 16 个健康题库会被 1 个坏文件陪葬。
+            match load_one_bank(&path, BankId(stem)) {
+                Ok(result) => results.push(result),
+                Err(e) => issues.push(LoadIssue {
+                    source_id: Self::ID.to_string(),
+                    path: path.clone(),
+                    message: e.to_string(),
+                }),
+            }
         }
 
         results.sort_by(|a, b| a.bank_id.cmp(&b.bank_id));
-        Ok(results)
+        Ok(LoadOutcome { results, issues })
     }
 }
 
@@ -259,11 +287,7 @@ mod tests {
         .unwrap();
 
         // 2) 应跳过的文件
-        std::fs::write(
-            banks.join("answers_sample.json"),
-            r#"{"sample-bank": []}"#,
-        )
-        .unwrap();
+        std::fs::write(banks.join("answers_sample.json"), r#"{"sample-bank": []}"#).unwrap();
         std::fs::write(
             banks.join("selftest"),
             r#"{"meta":{"title":"x"},"questions":[]}"#,
@@ -298,7 +322,7 @@ mod tests {
     #[test]
     fn load_finds_one_bank_and_skips_extras() {
         let tmp = make_fixture_dir();
-        let results = JsonBanksSource.load(tmp.path()).unwrap();
+        let results = JsonBanksSource.load(tmp.path()).unwrap().results;
         assert_eq!(results.len(), 1);
         let bank = &results[0];
         assert_eq!(bank.bank_id.as_str(), "sample-bank");
@@ -308,7 +332,7 @@ mod tests {
     #[test]
     fn load_parses_meta_correctly() {
         let tmp = make_fixture_dir();
-        let results = JsonBanksSource.load(tmp.path()).unwrap();
+        let results = JsonBanksSource.load(tmp.path()).unwrap().results;
         let meta = results[0].meta.as_ref().unwrap();
         assert_eq!(meta.title, "示例题库");
         assert!(!meta.external);
@@ -319,7 +343,7 @@ mod tests {
     #[test]
     fn load_parses_question_fields() {
         let tmp = make_fixture_dir();
-        let results = JsonBanksSource.load(tmp.path()).unwrap();
+        let results = JsonBanksSource.load(tmp.path()).unwrap().results;
         let q1 = &results[0].questions[0];
         assert_eq!(q1.id.as_str(), "Q-001");
         assert_eq!(q1.number, Some(1));
@@ -336,7 +360,7 @@ mod tests {
     #[test]
     fn load_generates_synthetic_id_when_missing() {
         let tmp = make_fixture_dir();
-        let results = JsonBanksSource.load(tmp.path()).unwrap();
+        let results = JsonBanksSource.load(tmp.path()).unwrap().results;
         let q2 = &results[0].questions[1];
         // 原 id="" 被替换为 <bank>-1
         assert_eq!(q2.id.as_str(), "sample-bank-1");
@@ -353,7 +377,7 @@ mod tests {
     #[test]
     fn load_skips_answer_files() {
         let tmp = make_fixture_dir();
-        let results = JsonBanksSource.load(tmp.path()).unwrap();
+        let results = JsonBanksSource.load(tmp.path()).unwrap().results;
         // 应只返回 sample-bank,不应返回 answers_sample
         for r in &results {
             assert!(!r.bank_id.as_str().starts_with("answers_"));
@@ -375,9 +399,83 @@ mod tests {
         )
         .unwrap();
 
-        let results = JsonBanksSource.load(tmp.path()).unwrap();
+        let results = JsonBanksSource.load(tmp.path()).unwrap().results;
         let names: Vec<&str> = results.iter().map(|r| r.bank_id.as_str()).collect();
         assert_eq!(names, vec!["aaa-first", "sample-bank", "zzz-last"]);
+    }
+
+    #[test]
+    fn load_isolates_malformed_bank_file() {
+        // P0-1 回归:一个坏文件不能拖垮整个 load()。
+        // 修复前:load_one_bank 的 `?` 会让整个 source 返回 Err → 16 个健康题库陪葬。
+        let tmp = make_fixture_dir();
+        // 坏文件 1:JSON 语法错误
+        std::fs::write(tmp.path().join("banks/broken.json"), "{ not json ").unwrap();
+        // 坏文件 2:schema 不符(meta 缺 title)
+        std::fs::write(
+            tmp.path().join("banks/wrong-schema.json"),
+            r#"{"questions": [{"question": "无 meta"}]}"#,
+        )
+        .unwrap();
+
+        let outcome = JsonBanksSource.load(tmp.path()).unwrap();
+
+        // 健康题库仍然载入
+        assert_eq!(outcome.results.len(), 1, "坏文件不应影响健康题库");
+        assert_eq!(outcome.results[0].bank_id.as_str(), "sample-bank");
+        assert_eq!(outcome.results[0].questions.len(), 2);
+
+        // 两个坏文件各记一条 issue
+        assert_eq!(outcome.issues.len(), 2, "坏文件应各记一条 issue");
+        let names: Vec<String> = outcome
+            .issues
+            .iter()
+            .map(|i| i.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"broken.json".to_string()));
+        assert!(names.contains(&"wrong-schema.json".to_string()));
+        // issue 必须带 source_id 和可读原因,不能是空壳
+        assert!(outcome.issues.iter().all(|i| i.source_id == "json_banks"));
+        assert!(outcome.issues.iter().all(|i| !i.message.is_empty()));
+    }
+
+    #[test]
+    fn load_accepts_scalar_answer_text_and_keys() {
+        // P0-1 回归:真实数据里 answerText / answerKeys 可能是标量字符串而不是数组。
+        // 修复前:serde 类型不匹配 → 整个 bank 解析失败。
+        let tmp = make_fixture_dir();
+        std::fs::write(
+            tmp.path().join("banks/scalar.json"),
+            r#"{
+                "meta": { "title": "标量答案" },
+                "questions": [
+                    {
+                        "id": "S-1", "question": "题干",
+                        "answerKeys": "B",
+                        "answerText": "30分钟"
+                    },
+                    {
+                        "id": "S-2", "question": "题干2",
+                        "answerKeys": ["A", "B"],
+                        "answerText": ["对"]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let outcome = JsonBanksSource.load(tmp.path()).unwrap();
+        assert!(outcome.issues.is_empty(), "标量答案不应产生 issue");
+        let scalar = outcome
+            .results
+            .iter()
+            .find(|r| r.bank_id.as_str() == "scalar")
+            .expect("scalar bank 应载入");
+        assert_eq!(scalar.questions[0].answer_keys, vec!["B"]);
+        assert_eq!(scalar.questions[0].answer_text, vec!["30分钟"]);
+        // 数组形态不受影响
+        assert_eq!(scalar.questions[1].answer_keys, vec!["A", "B"]);
+        assert_eq!(scalar.questions[1].answer_text, vec!["对"]);
     }
 
     #[test]
@@ -402,8 +500,7 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos();
-                let path = std::env::temp_dir()
-                    .join(format!("{}-{}-{}", prefix, pid, nanos));
+                let path = std::env::temp_dir().join(format!("{}-{}-{}", prefix, pid, nanos));
                 std::fs::create_dir_all(&path)?;
                 Ok(Self(path))
             }

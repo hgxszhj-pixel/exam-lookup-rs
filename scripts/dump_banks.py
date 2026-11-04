@@ -15,10 +15,28 @@ def norm(s: str) -> str:
     return _PUNC.sub("", s or "")
 
 def stem_of(s: str) -> str:
-    s = re.sub(r"^[A-F][\.\)、:：]\s*", "", s or "")
-    s = re.sub(r"^[（(]\s*\d+\s*[)）]\s*", "", s)
-    s = re.sub(r"^\d+[\.\)、:：]\s*", "", s)
-    return s.strip()
+    """对齐 Python `solve.py::stem_of`(Rust `parse::stem_of` 对齐的也是它)。
+
+    原实现是另写的一套(剥前导 A-F / 剥前导括号数字 / 剥前导题号),
+    与 solve.py 无关 —— parity 比的是同一套契约,两边必须用同一个定义。
+    """
+    t = re.split(r"[（(]\s*[)）]\s*", s or "")[0]
+    if norm(t) == norm(s):
+        t = re.split(r"\s*A[.、．]\s*", s or "")[0]
+    return t.strip()
+
+def as_list(v):
+    """标量 → 单元素列表。
+
+    与 Python 端 kb_db.py:628 的契约一致:
+        at = q.get("answerText")
+        items = at if isinstance(at, list) else ([at] if at else [])
+    真实数据里 answerText 确实存在标量形态(如 "30分钟"),不做这层归一化
+    会被 join 成 "3、0、分、钟" —— parity 假差异。
+    """
+    if v is None or v == "":
+        return []
+    return list(v) if isinstance(v, list) else [v]
 
 def main() -> int:
     if len(sys.argv) < 3:
@@ -55,8 +73,8 @@ def main() -> int:
                 "nq": norm(stem),
                 "nqstem": norm(stem_of(stem)),
                 "options": q.get("options") or [],
-                "answerKeys": q.get("answerKeys") or [],
-                "answerText": "、".join(q.get("answerText") or []),
+                "answerKeys": as_list(q.get("answerKeys")),
+                "answerText": "、".join(str(x) for x in as_list(q.get("answerText"))),
                 "analysis": q.get("analysis"),
                 "topic": q.get("topic"),
                 "srcBank": q.get("srcBank"),

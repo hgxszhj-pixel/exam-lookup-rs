@@ -16,7 +16,7 @@
 use rusqlite::{params, Connection};
 
 use crate::error::{EngineError, Result};
-use crate::parse::{norm, stem_of};
+use crate::parse::{fold_punct_to_space, norm, stem_of};
 
 /// 搜索结果单条。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -120,9 +120,7 @@ fn try_stem_exact(conn: &Connection, text: &str) -> Result<Option<SearchHit>> {
         return Ok(None);
     }
     let mut stmt = conn
-        .prepare_cached(
-            "SELECT id, src, question, answer FROM q WHERE nqstem = ? LIMIT 1",
-        )
+        .prepare_cached("SELECT id, src, question, answer FROM q WHERE nqstem = ? LIMIT 1")
         .map_err(|e| EngineError::other(format!("prepare stem exact: {e}")))?;
     let mut rows = stmt
         .query(params![stem])
@@ -132,8 +130,12 @@ fn try_stem_exact(conn: &Connection, text: &str) -> Result<Option<SearchHit>> {
         .map_err(|e| EngineError::other(format!("next row: {e}")))?
     {
         Ok(Some(SearchHit {
-            id: row.get(0).map_err(|e| EngineError::other(format!("col 0: {e}")))?,
-            src: row.get(1).map_err(|e| EngineError::other(format!("col 1: {e}")))?,
+            id: row
+                .get(0)
+                .map_err(|e| EngineError::other(format!("col 0: {e}")))?,
+            src: row
+                .get(1)
+                .map_err(|e| EngineError::other(format!("col 1: {e}")))?,
             question: row
                 .get(2)
                 .map_err(|e| EngineError::other(format!("col 2: {e}")))?,
@@ -167,7 +169,10 @@ fn try_fts(conn: &Connection, q: &SearchQuery) -> Result<Vec<SearchHit>> {
         .query(params![fts_term, bank, bank, q.limit as i64])
         .map_err(|e| EngineError::other(format!("query fts: {e}")))?;
     let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| EngineError::other(format!("row: {e}")))? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| EngineError::other(format!("row: {e}")))?
+    {
         out.push(mapper(row).map_err(|e| EngineError::other(format!("map: {e}")))?);
     }
     Ok(out)
@@ -192,7 +197,10 @@ fn try_like(conn: &Connection, q: &SearchQuery) -> Result<Vec<SearchHit>> {
         .query(params![like_pat, bank, bank, q.limit as i64])
         .map_err(|e| EngineError::other(format!("query like: {e}")))?;
     let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| EngineError::other(format!("row: {e}")))? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| EngineError::other(format!("row: {e}")))?
+    {
         out.push(mapper(row).map_err(|e| EngineError::other(format!("map: {e}")))?);
     }
     Ok(out)
@@ -279,7 +287,9 @@ fn try_like_card(conn: &Connection, q: &SearchQuery) -> Result<Vec<CardHit>> {
     Ok(out)
 }
 
-fn map_card_hit(kind: MatchKind) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> rusqlite::Result<CardHit> {
+fn map_card_hit(
+    kind: MatchKind,
+) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> rusqlite::Result<CardHit> {
     move |row| {
         Ok(CardHit {
             id: row.get(0)?,
@@ -292,7 +302,9 @@ fn map_card_hit(kind: MatchKind) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> ru
     }
 }
 
-fn map_hit(kind: MatchKind) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> rusqlite::Result<SearchHit> {
+fn map_hit(
+    kind: MatchKind,
+) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> rusqlite::Result<SearchHit> {
     move |row| {
         let id: String = row.get(0)?;
         let src: String = row.get(1)?;
@@ -321,7 +333,10 @@ fn map_hit(kind: MatchKind) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> rusqlit
 /// - 单/双 ASCII 字符 → `"<char>"`(精确)
 /// - CJK 字符 → 每个字一个 token `"<字>"`(unicode61 索引也是按字)
 fn build_fts_term(text: &str) -> String {
-    let normalized = norm(text);
+    // 用 fold_punct_to_space(不是 norm):unicode61 把标点当分隔符,
+    // 查询串必须在标点处断词,否则 "hello,world" 会变成单 token "helloworld",
+    // 与索引里的两个 token 对不上。
+    let normalized = fold_punct_to_space(text);
     if normalized.is_empty() {
         return String::new();
     }
@@ -390,7 +405,9 @@ fn is_cjk(ch: char) -> bool {
 
 fn escape_like(s: &str) -> String {
     // SQLite LIKE 默认 escape 关闭;转义 `%` `_` `\`
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 #[cfg(test)]
