@@ -95,7 +95,10 @@ impl WrongBookStore {
     }
 
     pub fn entries(&self) -> Vec<WrongEntry> {
-        self.inner.read().map(|b| b.entries().to_vec()).unwrap_or_default()
+        self.inner
+            .read()
+            .map(|b| b.entries().to_vec())
+            .unwrap_or_default()
     }
 
     #[allow(dead_code)] // 留作未来 GUI 进度条 / header 角标
@@ -108,13 +111,7 @@ impl WrongBookStore {
         self.len() == 0
     }
 
-    pub fn add(
-        &self,
-        qid: &str,
-        src: &str,
-        question: &str,
-        my_answer: &str,
-    ) -> Result<(), String> {
+    pub fn add(&self, qid: &str, src: &str, question: &str, my_answer: &str) -> Result<(), String> {
         let mut g = self.inner.write().map_err(|e| e.to_string())?;
         g.add(qid, src, question, my_answer)?;
         let json = serde_json::to_string_pretty(&*g).map_err(|e| e.to_string())?;
@@ -179,7 +176,8 @@ mod tests {
         let path = dir.path().join("wrong.json");
         let book = WrongBook::default();
         std::fs::write(&path, serde_json::to_string_pretty(&book).unwrap()).unwrap();
-        let read: WrongBook = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let read: WrongBook =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(read.entries().is_empty());
     }
 

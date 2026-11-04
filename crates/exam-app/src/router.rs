@@ -1,6 +1,6 @@
 //! 路由配置:5 个 Tab + 顶层 ShellLayout(顶栏 + Outlet)。
 
-use crate::ui::{AskPage, CardsPage, PracticePage, SettingsPage, WrongBookPage, HelpBar};
+use crate::ui::{AskPage, CardsPage, HelpBar, PracticePage, SettingsPage, WrongBookPage};
 use dioxus::prelude::*;
 use dioxus_router::*;
 

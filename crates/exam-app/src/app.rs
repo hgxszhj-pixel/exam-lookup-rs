@@ -1,7 +1,7 @@
 //! 应用根:`App` + Router(ShellLayout + Outlet)。
 
 use crate::router::Route;
-use crate::state::{AppState, apply_theme_to_root};
+use crate::state::{apply_theme_to_root, AppState};
 use dioxus::prelude::*;
 use dioxus_router::Router;
 

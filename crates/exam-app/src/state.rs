@@ -51,9 +51,7 @@ impl Theme {
 /// Desktop 启动时 + Settings 保存后各调一次。
 pub fn apply_theme_to_root(theme: Theme) {
     let script = match theme.data_attr() {
-        Some(v) => format!(
-            r#"document.documentElement.setAttribute('data-theme','{v}');"#
-        ),
+        Some(v) => format!(r#"document.documentElement.setAttribute('data-theme','{v}');"#),
         None => r#"document.documentElement.removeAttribute('data-theme');"#.to_string(),
     };
     let _ = dioxus::document::eval(&script);
@@ -109,7 +107,9 @@ fn default_settings_path() -> PathBuf {
 pub enum DbStatus {
     #[default]
     Unloaded,
-    Ready { questions: usize },
+    Ready {
+        questions: usize,
+    },
     Error(String),
 }
 
@@ -154,7 +154,9 @@ impl AppState {
         let status = match Connection::open(&db_path) {
             Ok(c) => {
                 let s = match count_questions(&c) {
-                    Ok(n) => DbStatus::Ready { questions: n as usize },
+                    Ok(n) => DbStatus::Ready {
+                        questions: n as usize,
+                    },
                     Err(e) => DbStatus::Error(format!("读取 DB 失败:{e}")),
                 };
                 if let Ok(mut g) = db.lock() {
@@ -189,7 +191,12 @@ impl AppState {
         state
     }
 
-    pub fn search(&self, query: &str, bank: Option<&str>, limit: usize) -> Result<Vec<SearchHit>, String> {
+    pub fn search(
+        &self,
+        query: &str,
+        bank: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, String> {
         let guard = self.db.lock().map_err(|e| e.to_string())?;
         let conn = guard.as_ref().ok_or_else(|| "DB 未就绪".to_string())?;
         let mut q = SearchQuery::new(query).with_limit(limit);
@@ -230,7 +237,10 @@ impl AppState {
 
     #[allow(dead_code)]
     pub fn db_status_snapshot(&self) -> DbStatus {
-        self.db_status.read().map(|s| s.clone()).unwrap_or(DbStatus::Unloaded)
+        self.db_status
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or(DbStatus::Unloaded)
     }
 
     /// 从 `data_root`(bank JSON + crawl 目录)重建索引到 `db_path`。
@@ -240,11 +250,7 @@ impl AppState {
     ///
     /// Phase M:用 `rebuild_lock.try_lock()` 防并发 — 用户点按钮 + watcher 线程 + bootstrap
     /// 同时只一个能跑。锁不上立即返 Err,UI 显示"重建中…"(而不是阻塞 UI 线程)。
-    pub fn rebuild_index(
-        &self,
-        data_root: &Path,
-        db_path: &Path,
-    ) -> Result<BuildStats, String> {
+    pub fn rebuild_index(&self, data_root: &Path, db_path: &Path) -> Result<BuildStats, String> {
         let _guard = self
             .rebuild_lock
             .try_lock()
@@ -275,7 +281,9 @@ impl AppState {
 
         // 4. 写 db_status = Ready{N}
         if let Ok(mut s) = self.db_status.write() {
-            *s = DbStatus::Ready { questions: stats.questions };
+            *s = DbStatus::Ready {
+                questions: stats.questions,
+            };
         }
         Ok(stats)
     }
@@ -627,7 +635,10 @@ mod tests {
             ..Default::default()
         };
         let s = AppState::bootstrap_from(settings);
-        assert!(s.is_watcher_enabled(), "auto_rebuild=true → bootstrap 启 watcher");
+        assert!(
+            s.is_watcher_enabled(),
+            "auto_rebuild=true → bootstrap 启 watcher"
+        );
         assert!(s.watcher.lock().unwrap().is_some());
         s.stop_watcher(); // 清理
     }
@@ -643,7 +654,10 @@ mod tests {
             ..Default::default()
         };
         let s = AppState::bootstrap_from(settings);
-        assert!(!s.is_watcher_enabled(), "auto_rebuild=false → bootstrap 不启 watcher");
+        assert!(
+            !s.is_watcher_enabled(),
+            "auto_rebuild=false → bootstrap 不启 watcher"
+        );
         assert!(s.watcher.lock().unwrap().is_none());
     }
 
@@ -689,7 +703,10 @@ mod tests {
         // sync_watcher(true) → 强制重启,新线程监听 dir_b
         s.sync_watcher(true);
         assert!(s.is_watcher_enabled(), "sync(true) 后 enabled=true");
-        assert!(s.watcher.lock().unwrap().is_some(), "sync(true) 后 slot 仍 Some(新 handle)");
+        assert!(
+            s.watcher.lock().unwrap().is_some(),
+            "sync(true) 后 slot 仍 Some(新 handle)"
+        );
 
         // 清理
         s.stop_watcher();

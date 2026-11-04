@@ -1,12 +1,17 @@
 //! SettingsPage:主题 / data root / db path 设置 + 持久化 + 重建索引(Phase H)。
 
-use crate::state::{AppSettings, AppState, DbStatus, Theme, apply_theme_to_root, save_settings};
+use crate::state::{apply_theme_to_root, save_settings, AppSettings, AppState, DbStatus, Theme};
 use dioxus::prelude::*;
 
 #[component]
 pub fn SettingsPage() -> Element {
     let state = use_context::<AppState>();
-    let current = state.settings.read().ok().map(|s| s.clone()).unwrap_or_default();
+    let current = state
+        .settings
+        .read()
+        .ok()
+        .map(|s| s.clone())
+        .unwrap_or_default();
     let mut data_root = use_signal(|| current.data_root.to_string_lossy().to_string());
     let mut db_path = use_signal(|| current.db_path.to_string_lossy().to_string());
     let mut theme = use_signal(|| current.theme);
@@ -268,7 +273,10 @@ mod ssr_tests {
         assert!(html.contains("设置"), "页面标题 '设置' 必须出现");
         assert!(html.contains("data_root 题库目录"), "data_root 标签");
         assert!(html.contains("db_path 索引文件"), "db_path 标签");
-        assert!(html.contains("data_root 变化时自动重建索引"), "auto_rebuild 卡片");
+        assert!(
+            html.contains("data_root 变化时自动重建索引"),
+            "auto_rebuild 卡片"
+        );
         assert!(html.contains("保存"), "保存按钮");
         assert!(html.contains("重建索引"), "重建按钮");
 
