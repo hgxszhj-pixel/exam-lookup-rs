@@ -159,6 +159,7 @@ cargo run --bin exam-cli -- --data-root /path/to/exam-lookup load --source json_
 | R-012 | Phase I+ 主题实时预览(select onchange 即时 apply + cycle 按钮) | ✅ 89/89 tests,clippy clean |
 | R-013 | Phase I++ 主题色板预览条(5 色块零事件跟随根 data-theme) | ✅ 89/89 tests,clippy clean |
 | R-015 | `dump_parity.sh` 题目级 parity(Python vs Rust dump) | ✅ 0/1768 不一致(0.00%),门禁能变红 |
+| R-016 | 全量代码审计(2026-11-04,P0×2 / P1×4 / P2×11 + 环境 1) | ✅ 10 项建议修复全部落地 → 153 tests |
 | R-COVERAGE | Phase F 80% 覆盖率验收 | ✅ 纯逻辑 ~85%(Phase F 快照) |
 | R-PERF | Phase I 性能基线 + 容忍上限 | ✅ build_index ≤ 35ms / search ≤ 2.5ms |
 | R-FINAL | v1.0 封盘报告(2026-10-04) | ✅ 封盘,后续见 HANDOFF |

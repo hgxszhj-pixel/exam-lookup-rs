@@ -31,7 +31,7 @@ I+++ notify watcher 模块 · J 首启动 UX + 快捷键 · K 三篇 doc ·
 **Q 2026-10-12 dump_parity.sh 实际生成 — 1760 Q 0.00% diff(R-015)**
 **R 2026-11-04 审计修复轮 — 9 项 P0/P1/P2 修复落地(P0-1/P0-2/P1-1/P1-2/P1-3/P1-4/P2-3/P2-7 + 文档对齐 P2-5)→ 153 tests**
 
-报表:`docs/reports/R-001..R-013` + `R-015`(**无 R-014**) + `R-COVERAGE.md` + `R-PERF.md` + `R-FINAL.md` + **`docs/plans/2026-10-12-audit-fix.md`** + **`docs/plans/2026-10-12-watcher-integration.md`**
+报表:`docs/reports/R-001..R-013` + `R-015` + **`R-016`(2026-11-04 全量代码审计)**(**无 R-014**) + `R-COVERAGE.md` + `R-PERF.md` + `R-FINAL.md` + **`docs/plans/2026-10-12-audit-fix.md`** + **`docs/plans/2026-10-12-watcher-integration.md`**
 设计:`docs/architecture.md` + `docs/port-from-python.md` + `docs/engine-design.md`
 
 ## 关键文件
@@ -141,7 +141,7 @@ crates/exam-app/src/ui/settings.rs     — 数据根 + 主题 + DB 徽章
 
 ## 2026-11-04 审计修复轮(Phase R)
 
-**来源**:代码审计报告 `~/develop_software/exam-lookup-rs-audit-2026-11-04.md`(仓外)。
+**来源**:代码审计报告 R-016 —— 已归档进仓 `docs/reports/R-016-code-audit-2026-11-04.md`(仓外副本 `~/develop_software/exam-lookup-rs-audit-2026-11-04.md`)。
 **分支**:`worktree-audit-fix-2026-11-04`(worktree 隔离,未合 main)。
 **结果**:129 → **153 tests**(engine 130 / app 23 / cli 0),clippy 0 error,fmt clean,真实数据 parity 0.00%。
 
