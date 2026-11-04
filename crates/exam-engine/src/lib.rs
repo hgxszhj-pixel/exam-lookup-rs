@@ -14,6 +14,7 @@ pub mod cache;
 pub mod error;
 pub mod index;
 pub mod parse;
+pub mod perf_budget;
 pub mod scheduler;
 pub mod search;
 pub mod source;
@@ -23,6 +24,11 @@ pub mod watcher;
 pub use cache::{compute_status, now_secs, should_refresh, CacheEntry, CacheStatus, CacheStore};
 pub use error::{EngineError, Result};
 pub use index::{build_with_source, open_readonly, BuildStats, IndexBuilder};
+pub use perf_budget::{
+    assert_within, check, median, percentile, scale_from_env, BudgetExceeded, PerfBudget,
+    ALL_BUDGETS, BUILD_INDEX, GATE_QUANTILE, LOAD_CRAWL_CARDS, LOAD_JSON_BANKS, SEARCH_CARDS_FTS,
+    SEARCH_FTS, SEARCH_LIKE,
+};
 pub use scheduler::{Scheduler, SchedulerConfig, TickOutcome};
 pub use search::{search, search_cards, CardHit, MatchKind, SearchHit, SearchQuery};
 pub use source::{all_sources, find_source, Interval, LoadIssue, LoadOutcome, LoadResult, Source};
