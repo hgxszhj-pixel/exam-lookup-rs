@@ -191,7 +191,7 @@ fn try_like(conn: &Connection, q: &SearchQuery) -> Result<Vec<SearchHit>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, src, question, answer, 0.0 FROM q \
-             WHERE nq LIKE ? AND (? IS NULL OR src = ?) \
+             WHERE nq LIKE ? ESCAPE '\\' AND (? IS NULL OR src = ?) \
              ORDER BY length(nq) LIMIT ?",
         )
         .map_err(|e| EngineError::other(format!("prepare like: {e}")))?;
@@ -274,7 +274,7 @@ fn try_like_card(conn: &Connection, q: &SearchQuery) -> Result<Vec<CardHit>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, src, title, body, 0.0 FROM card \
-             WHERE title LIKE ? OR body LIKE ? \
+             WHERE title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\' \
              ORDER BY length(title) LIMIT ?",
         )
         .map_err(|e| EngineError::other(format!("prepare like card: {e}")))?;
@@ -408,8 +408,15 @@ fn is_cjk(ch: char) -> bool {
     )
 }
 
+/// 转义 LIKE 模式里的通配符。
+///
+/// **必须配合 SQL 里的 `ESCAPE '\'` 子句** —— SQLite 默认把 `\` 当普通字面量,
+/// 没有 ESCAPE 时 `%a\%b\_c%` 匹配不到字面值 `a%b_c`(实测:含 `100%` 的题干
+/// 永远查不到)。顺序不能换:先转义 `\` 自身,再转义 `%` / `_`。
+///
+/// 注:`norm()` 会删掉 `_` 和 `\`(它们在 Python `_PUNC` 里),所以实际能漏到
+/// 这里的通配符主要是 `%`。
 fn escape_like(s: &str) -> String {
-    // SQLite LIKE 默认 escape 关闭;转义 `%` `_` `\`
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
@@ -454,11 +461,15 @@ mod tests {
     #[test]
     fn like_fallback_for_substring() {
         let conn = fixture();
-        // 中文短词可能被 unicode61 切得太细,触发 LIKE 兜底
-        let q = SearchQuery::new("密码").with_limit(5);
-        let hits = search(&conn, &q).unwrap();
-        assert!(!hits.is_empty(), "至少 LIKE 兜底命中");
+        // 直接调 try_like —— 走 search() 的话 FTS 先命中,这个测试就钉不住兜底路径
+        // (旧写法:即使**整个删掉 try_like**,该测试照样通过)。
+        let hits = try_like(&conn, &SearchQuery::new("密码").with_limit(5)).unwrap();
+        assert!(!hits.is_empty(), "LIKE 兜底应命中");
         assert!(hits.iter().any(|h| h.question.contains("密码")));
+        assert!(
+            hits.iter().all(|h| h.match_kind == MatchKind::Like),
+            "兜底路径的 kind 必须是 Like"
+        );
     }
 
     #[test]
@@ -571,6 +582,51 @@ mod tests {
     #[test]
     fn escape_like_handles_wildcards() {
         assert_eq!(escape_like("a%b_c"), "a\\%b\\_c");
+    }
+
+    /// P1-2 回归:LIKE 兜底必须真的把通配符当字面量。
+    ///
+    /// 修复前:`escape_like` 输出了反斜杠转义,但两条 LIKE 查询都**没有 `ESCAPE '\'`**
+    /// —— SQLite 无 ESCAPE 时把 `\` 当普通字面量 → 模式 `%100\%%` 匹配不到字面值
+    /// `100%`(实测:含 `100%` 的题永远查不到)。旧测试只断言转义后的字符串,
+    /// **从不验证 SQL 是否匹配** —— 整个转义机制坏掉,测试照绿。
+    #[test]
+    fn like_fallback_treats_percent_as_literal() {
+        let conn = percent_fixture();
+        // 直接调 try_like:走 search() 的话 FTS 会先命中,钉不住兜底路径
+        // (旧测试 `like_fallback_for_substring` 就是这么"测"的 —— 删掉 try_like 它照样绿)。
+        let hits = try_like(&conn, &SearchQuery::new("100%").with_limit(10)).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "字面量 '100%' 应命中含百分号的那一题(修复前 0 条)"
+        );
+        assert!(hits[0].question.contains("100%"));
+
+        // 反向:不存在的字面量不该命中任何题
+        let none = try_like(&conn, &SearchQuery::new("999%").with_limit(10)).unwrap();
+        assert!(none.is_empty(), "'999%' 不该命中任何题");
+    }
+
+    /// 含 `%` 字面量的题干 + 一道干扰题。
+    fn percent_fixture() -> Connection {
+        let dir = tempfile::tempdir().unwrap();
+        let banks = dir.path().join("banks");
+        std::fs::create_dir_all(&banks).unwrap();
+        std::fs::write(
+            banks.join("pct.json"),
+            r#"{
+                "meta": {"title": "百分号"},
+                "questions": [
+                    {"id":"p-1","number":1,"type":"single","question":"增长率100%的计算方法","answerKeys":["A"]},
+                    {"id":"p-2","number":2,"type":"single","question":"增长率100元的计算方法","answerKeys":["B"]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::index::build_with_source(&mut conn, &JsonBanksSource, dir.path()).unwrap();
+        conn
     }
 
     // ================ Phase G: search_cards() ================

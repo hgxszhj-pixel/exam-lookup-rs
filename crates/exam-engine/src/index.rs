@@ -1313,7 +1313,7 @@ mod tests {
             .unwrap();
         }
 
-        let mut b = IndexBuilder::open(&db_path).unwrap();
+        let b = IndexBuilder::open(&db_path).unwrap();
         b.init_schema().expect("migration must succeed");
         let conn = b.connection();
 
