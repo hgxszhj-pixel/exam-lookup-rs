@@ -155,10 +155,14 @@ fn try_fts(conn: &Connection, q: &SearchQuery) -> Result<Vec<SearchHit>> {
     if fts_term.is_empty() {
         return Ok(Vec::new());
     }
+    // JOIN 条件用 `rowid` 而不是 `id`:
+    // `q_fts.rowid == q.rowid` 是 1:1 映射(见 `index.rs::insert_load_result`),
+    // 而 `id` 在跨 bank 时会重复 —— 用 `id` join 就会一对多扇出,
+    // 同一条命中重复返回,`LIMIT 16` 实际只给 8 个不同问题(P1-1)。
     let mut stmt = conn
         .prepare(
             "SELECT q.id, q.src, q.question, q.answer, bm25(q_fts) \
-             FROM q_fts JOIN q ON q.id = q_fts.id \
+             FROM q_fts JOIN q ON q.rowid = q_fts.rowid \
              WHERE q_fts MATCH ? AND (? IS NULL OR q.src = ?) \
              ORDER BY bm25(q_fts) LIMIT ?",
         )
@@ -238,10 +242,11 @@ fn try_fts_card(conn: &Connection, q: &SearchQuery) -> Result<Vec<CardHit>> {
     if fts_term.is_empty() {
         return Ok(Vec::new());
     }
+    // 同 `try_fts`:`card_fts.rowid == card.rowid` 是 1:1 映射,用 rowid join 不会扇出。
     let mut stmt = conn
         .prepare(
             "SELECT card.id, card.src, card.title, card.body, bm25(card_fts) \
-             FROM card_fts JOIN card ON card.id = card_fts.id \
+             FROM card_fts JOIN card ON card.rowid = card_fts.rowid \
              WHERE card_fts MATCH ? \
              ORDER BY bm25(card_fts) LIMIT ?",
         )
@@ -469,9 +474,70 @@ mod tests {
     #[test]
     fn bank_filter_narrows_results() {
         let conn = fixture();
-        let q = SearchQuery::new("网络").with_bank("a.json");
+        // bank id 是文件名去后缀(`a.json` → `a`),旧测试写 "a.json" → 过滤不中任何行,
+        // `all()` 在空集合上恒真 —— 测试其实什么都没验。
+        let q = SearchQuery::new("网络").with_bank("a");
         let hits = search(&conn, &q).unwrap();
-        assert!(hits.iter().all(|h| h.src == "a.json"));
+        assert!(!hits.is_empty(), "过滤到 bank 'a' 应有命中");
+        assert!(hits.iter().all(|h| h.src == "a"));
+    }
+
+    /// 两个 bank 用同一批 question id(真实数据:1768 题里 129 个 id 跨 bank 重复)。
+    fn cross_bank_fixture() -> Connection {
+        let dir = tempfile::tempdir().unwrap();
+        let banks = dir.path().join("banks");
+        std::fs::create_dir_all(&banks).unwrap();
+        for (bank, title) in [("a.json", "A"), ("b.json", "B")] {
+            std::fs::write(
+                banks.join(bank),
+                format!(
+                    r#"{{
+                        "meta": {{"title": "{title}"}},
+                        "questions": [
+                            {{"id":"dup-1","number":1,"type":"single","question":"网络安全基础","answerKeys":["A"]}},
+                            {{"id":"dup-2","number":2,"type":"single","question":"网络安全进阶","answerKeys":["B"]}}
+                        ]
+                    }}"#
+                ),
+            )
+            .unwrap();
+        }
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::index::build_with_source(&mut conn, &JsonBanksSource, dir.path()).unwrap();
+        conn
+    }
+
+    /// P1-1 回归:FTS 命中不得重复返回同一条问题。
+    ///
+    /// 修复前:`q` 单列主键 + REPLACE(跨 bank 同 id 互相顶掉)、`q_fts` 普通 INSERT
+    /// (不去重)→ `JOIN q ON q.id = q_fts.id` 一对多扇出 → 同一条命中出现两次,
+    /// `LIMIT 16` 实际只给 8 个不同问题。
+    #[test]
+    fn fts_search_returns_each_question_once() {
+        let conn = cross_bank_fixture();
+        let hits = search(&conn, &SearchQuery::new("网络安全").with_limit(16)).unwrap();
+        assert_eq!(hits.len(), 4, "2 bank × 2 题都应命中");
+
+        let mut keys: Vec<(String, String)> =
+            hits.iter().map(|h| (h.src.clone(), h.id.clone())).collect();
+        keys.sort();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), before, "同一条命中不应重复返回(P1-1 扇出)");
+    }
+
+    /// P1-1 回归:`LIMIT` 必须作用在**不同问题**上。
+    /// 修复前:limit=16 只给 8 个不同问题(另一半是重复行)。
+    #[test]
+    fn limit_counts_distinct_questions() {
+        let conn = cross_bank_fixture();
+        let hits = search(&conn, &SearchQuery::new("网络安全").with_limit(2)).unwrap();
+        assert_eq!(hits.len(), 2, "limit=2 应返回 2 行");
+        let mut keys: Vec<(String, String)> =
+            hits.iter().map(|h| (h.src.clone(), h.id.clone())).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 2, "limit=2 应给出 2 个不同问题");
     }
 
     #[test]

@@ -165,6 +165,10 @@ fn load_one_card_file(path: &Path, bank_id: BankId) -> Result<LoadResult, Engine
         serde_json::from_slice(&bytes).map_err(|e| EngineError::json(path, e))?;
 
     let mut cards = Vec::new();
+    // id 去重:同一个文件里 `num` 可能重复(实测真实数据 1278 张卡片里有 110 组重复),
+    // 旧实现按 `<bank>-<num>` 直接生成 id → 同名卡片在 `card` 表被 `INSERT OR REPLACE`
+    // 静默顶掉(实测丢 230 张)。这里保证**文件内 id 唯一**。
+    let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (idx, raw_card) in raw.questions.into_iter().enumerate() {
         let q = raw_card.q.unwrap_or_default();
         let a = raw_card.a.unwrap_or_default();
@@ -192,11 +196,18 @@ fn load_one_card_file(path: &Path, bank_id: BankId) -> Result<LoadResult, Engine
             }
         }
 
-        // id: <bank>-<num or idx> 保持稳定(同一文件多次载入不变)
-        let id = match raw_card.num {
+        // id: <bank>-<num or idx> 保持稳定(同一文件多次载入不变);
+        // 重名时追加序号,保证文件内唯一(见上面的 used_ids)。
+        let base = match raw_card.num {
             Some(n) => format!("{}-{}", bank_id.0, n),
             None => format!("{}-{}", bank_id.0, idx),
         };
+        let mut id = base.clone();
+        let mut dup = 1;
+        while !used_ids.insert(id.clone()) {
+            id = format!("{base}-{dup}");
+            dup += 1;
+        }
 
         cards.push(CardItem {
             id,
@@ -310,6 +321,37 @@ mod tests {
         let s = CrawlCardsSource;
         assert_eq!(s.id(), "crawl_cards");
         assert!(s.display_name().contains("问答"));
+    }
+
+    /// P1-1 回归:同一文件里 `num` 重复时,卡片 id 必须唯一。
+    ///
+    /// 修复前:id 直接按 `<bank>-<num>` 生成 → 同名卡片在 `card` 表被
+    /// `INSERT OR REPLACE` 静默顶掉(实测真实数据 1278 张卡片丢了 230 张),
+    /// 而 `card_fts` 不去重 → 行数不等 → join 扇出。
+    #[test]
+    fn duplicate_num_in_same_file_yields_unique_card_ids() {
+        let dir = tempdir::TempDir::new("exam-engine-crawl-dup").unwrap();
+        let crawl = dir.path().join("crawl");
+        std::fs::create_dir_all(&crawl).unwrap();
+        std::fs::write(
+            crawl.join("重复-问答.json"),
+            r#"{
+                "questions": [
+                    {"num": 1, "q": "问一", "a": "答一"},
+                    {"num": 1, "q": "问二", "a": "答二"},
+                    {"num": 2, "q": "问三", "a": "答三"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let results = CrawlCardsSource.load(dir.path()).unwrap().results;
+        let cards = &results[0].cards;
+        assert_eq!(cards.len(), 3, "3 张卡片都要保留");
+        let mut ids: Vec<&str> = cards.iter().map(|c| c.id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "文件内卡片 id 必须唯一(不能被 REPLACE 顶掉)");
     }
 
     #[test]
