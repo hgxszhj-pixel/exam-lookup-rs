@@ -53,7 +53,20 @@ crates/exam-app/src/state.rs           — AppState (db + signals)
 crates/exam-app/src/ui/settings.rs     — 数据根 + 主题 + DB 徽章
 .github/workflows/ci.yml             — CI: engine(ubuntu) fmt/clippy/test + app(macos) clippy/test + perf gate(ubuntu)
 rust-toolchain.toml                   — 锁 1.99.1(rustfmt 漂移会让 fmt 门禁在无关 PR 上变红)
+docs/platform-training-docs.md        — 平台培训文档清单(人读);.json 同名(机器可读) ⚠ 未入库,只在主 checkout 工作区
 ```
+
+## 2026-10-26 平台培训文档清单(新增资料源)
+
+**数据源**:知学云 `kc.zhixueyun.com` 本人账号「我的学习」—— 223 门课程 / 229 个文档 / 合计约 1.29 GB
+**产物**:`docs/platform-training-docs.md`(按专业分组的清单)+ `docs/platform-training-docs.json`(机器可读)
+**抓取**:`zhixueyun-kc-video` 技能新增 `scripts/kc_docs_collect.py`(`preview-new` → 公开 CDN `/document/<hash>.<ext>`,GET 免鉴权)
+**口径**:专业分类是按文件名+课程名关键词打分,属本仓库整理口径,非平台官方分类
+**未做**:不下载正文、不入库(清单只给地址);若要进 FTS 索引,下一步是把 pdf/docx 转文本后走既有 source 注册
+
+> ⚠ **2026-11-05 补记**:这一节(以及产物 `docs/platform-training-docs.*`)是 2026-10-26 在**主 checkout 的工作区**里写的,
+> **当时没提交** —— 所以本分支(以及 `main` 的已提交历史)里一直查不到。现已把记录并回本文件;
+> 产物文件本身仍只在主 checkout 的工作区,未入库(见「主 checkout 未提交改动」一节)。
 
 ## 2026-10-12 Audit Round 摘要
 
@@ -142,6 +155,17 @@ rust-toolchain.toml                   — 锁 1.99.1(rustfmt 漂移会让 fmt �
 **收口**:差异来源已记录,无需修代码(改任一方都是过度工程)。Report:`docs/reports/R-015-dump-parity.md`。
 
 > ⚠ **2026-11-04 修正**:上面 "diff:6 行 ≈ 0.00%" 的**判据是坏的** —— 分母用 `wc -l` 行数,而两个 dump 都是单行 JSON → 分母 0 → 差异率恒为 0.00%(假绿门禁)。P0-2 已把分母改成题目条数,同日重跑真实数据:**0/1768 不一致(0.00%)**,并加了门禁自测证明它能变红。详见 R-015。
+
+## 2026-10-26 资料库改 SQLite 主库(Python 侧)
+
+- 决策与实测:`~/x_videos-dowloads/exam-lookup/DATA_FORMAT.md`
+- 主库:`exam-lookup/jr/out/docs.sqlite`(13.6 MB,schema v1,187 条清单 / 177 条有正文 / 2,772 chunk)
+- 冷启动 531 ms → 6 ms,增量更新 整库重建 → 32 ms/篇,答题准确率同语料下不变(43/62)
+- 快照导出口:`exam-lookup/jr/out/docs_export.json`(带 schema_version);`docs/platform-training-docs.*` 仍是人读/Rust 侧清单,本次未覆盖
+- 本仓库无代码依赖该清单(`grep` 仅命中 docs 与 HANDOFF),无需改动
+
+> ⚠ **2026-11-05 补记**:同样是在主 checkout 工作区写的、**当时没提交**,本分支与 `main` 的已提交历史里都没有。
+> 现已并回本文件。内容本身是 **Python 侧仓库**(`~/x_videos-dowloads/exam-lookup`)的状态,不在本仓 Rust 代码里。
 
 ## 2026-11-04 审计修复轮(Phase R)
 
@@ -245,10 +269,64 @@ git push
 
 (SSH key 认证到的是**另一个** GitHub 账号 `hgxszhj`,对本仓库无写权限 —— 换 SSH 没用。)
 
+## 主 checkout 未提交改动(2026-11-05 实测)
+
+**位置**:`/Users/hgxszhj/develop_software/exam-lookup-rs`(分支 `main`,HEAD = `c06aca2` = PR #1 合并点)
+**状态**:`git status --porcelain` → **28 个已改 + 3 个未跟踪**
+
+⚠️ **一句话:审计工作一件都不在这里。** 主 checkout 装的是**审计前**的代码;
+本轮 9 项 P0/P1/P2 修复全部只在本分支上。主 checkout 的"脏"是**排版 + 依赖漂移 + 交接文档**。
+
+### 28 个已改文件 = 三类,没有第四类
+
+| 类 | 文件 | 是什么 | 证据 |
+|---|---|---|---|
+| rustfmt 重排 | 26 个 `.rs` | 有人/某次会话在主 checkout 跑了 `cargo fmt`,把 main HEAD 的旧排版改成当前 rustfmt 的排版(`use` 排序、struct literal 展开、签名换行) | **决定性证据**:把 main HEAD 干净检出到临时目录跑 `cargo fmt` 后,产物与主 checkout 工作区的 26 个 `.rs` 文件**逐字节完全相同(26/26)** —— 即工作区 ≡ `rustfmt(main HEAD)`,**零语义改动** |
+| Cargo.lock 依赖漂移 | `Cargo.lock` | +21 行:新增 `askama_escape 0.13.0`、`dioxus-ssr 0.7.10`(dioxus 0.7.10 的 ssr feature 传递依赖);`Cargo.toml` 的版本声明没动 | `git diff main -- Cargo.lock` 只增两个 `[[package]]` 块 |
+| 交接文档 | `HANDOFF.md` | +17 行 = 上面两节 2026-10-26 记录(已并回本文件,见两处 ⚠ 补记) | — |
+
+**方向别搞反**:这份 rustfmt 改动**不是垃圾** —— 它把 main 从「fmt 不合规」修成「合规」:
+main HEAD 干净检出跑 `cargo fmt --all -- --check` → **exit 1(73 处 diff)**;
+主 checkout 工作区跑同一命令 → **exit 0**。而且排版风格与本分支一致
+(例 `upsert_meta(&self.conn, "last_rebuild_at", &now_iso8601())?;` 单行,本分支同为单行)。
+但它**合并时挡路**,且内容会被分支版本整体替换 → **合并前丢掉**(见处置顺序)。
+
+### 审计工作不在主 checkout 的反证
+
+| 文件 | 主 checkout 工作区 | main HEAD | 本分支 |
+|---|---|---|---|
+| `crates/exam-engine/src/index.rs` | 616 行 | 600 行 | **1564 行** |
+| `crates/exam-app/src/state.rs` | generation / AtomicBool 痕迹 **4 处** | — | **11 处**(P1-3 watcher 隔离) |
+| `crates/exam-app/src/settings.rs` | `futures_channel` / `oneshot` **0 处** | — | **2 处**(P1-4 后台线程重建) |
+| `Cargo.lock` | **无** `futures-channel` | 同左 | **有** |
+
+28 个文件里 **12 个与本分支完全一致** —— 因为审计轮压根没碰它们;
+另外 16 个不同,差异**全部**落在上面三类里。
+
+### 3 个未跟踪
+
+| 路径 | 大小 | 处置 |
+|---|---|---|
+| `docs/platform-training-docs.md` | 49,863 B | **要救** —— 主 checkout 独有的产物,全仓库历史里从没提交过 |
+| `docs/platform-training-docs.json` | 121,267 B | 同上 |
+| `.omc/` | 4 KB × 2 | 不用管 —— 本分支 `.gitignore` 第 14 行已忽略 `.omc/`,合并后自动消失 |
+
+### 处置顺序(不能反)
+
+1. **先合 PR #2**,再处理主 checkout。反过来必卡:main 这 28 个本地改动与合并进来的文件重叠,
+   `git merge` 会直接拒绝(`Your local changes to the following files would be overwritten by merge`)。
+2. 合并前在主 checkout `git checkout -- .` —— 丢掉 fmt 重排 + Cargo.lock 漂移 + HANDOFF 旧版。
+   分支版本**已经是** fmt 合规、且带着审计要的 `futures-channel`,这 28 个文件的内容会被整体替换。
+   HANDOFF 的 2026-10-26 两节已在合并内容里,不会丢。
+3. `docs/platform-training-docs.{md,json}` 单独一次提交 rescue —— 合并前后都安全
+   (分支不含这两个路径,merge 不会覆盖;untracked 也不挡 merge)。建议合并完再做。
+
 ## 下次会话候选
 
 - **合并本轮**:branch `worktree-audit-fix-2026-11-04` → main(**PR #2**,https://github.com/hgxszhj-pixel/exam-lookup-rs/pull/2)。
   合并前先解掉 CI workflow commit 的 token 阻塞:`gh auth refresh -h github.com -s workflow` → `git push`。
+- **主 checkout 的 28 个脏文件**:合并前在主 checkout `git checkout -- .` 丢掉(不丢 merge 会被拒),
+  `docs/platform-training-docs.{md,json}` 单独提交救回来。详见「主 checkout 未提交改动」。
 - **R-004 决策未落地**:若仍要精确锁 `dioxus =0.7.9`,改 `crates/exam-app/Cargo.toml` 的 caret 为 `=0.7.9`(当前实解 0.7.10,代码在其上编译/测试全绿)。
 - **未修的小项**(本轮记录,均不影响正确性):重建期间顶部 DB 徽章显示旧题数(`ui/shell.rs:12` 每次渲染取快照 vs `rebuild_index` 先置 `Unloaded`)。
 - **门禁仍未全覆盖**:parity 门禁需外部 Python 仓库,进不了 CI;`exam-cli` 仍**零单测**。
