@@ -78,6 +78,29 @@ pub struct LoadResult {
     pub cards: Vec<CardItem>,
 }
 
+/// 单个文件的加载失败(非致命)。
+///
+/// P0-1:source 必须**逐文件隔离** —— 一个坏文件记一条 issue 后 continue,
+/// 不能把整个 `load()` 拖垮(否则 16 个健康题库被 1 个坏文件陪葬)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LoadIssue {
+    /// 出问题的 source id(如 `json_banks`)。
+    pub source_id: String,
+    /// 出问题的文件路径。
+    pub path: PathBuf,
+    /// 失败原因(人类可读)。
+    pub message: String,
+}
+
+/// Source 的加载产物:成功的 bank + 失败明细。
+#[derive(Debug, Default)]
+pub struct LoadOutcome {
+    /// 成功解析的 bank。
+    pub results: Vec<LoadResult>,
+    /// 逐文件失败明细(不致命)。
+    pub issues: Vec<LoadIssue>,
+}
+
 /// Source trait:每个 source 实现 `load()` 从 `data_root` 加载自身数据。
 ///
 /// Phase A 不涉及远程 fetch;后续 Phase 可加 `async fn fetch()` 走 HTTP。
@@ -88,7 +111,11 @@ pub trait Source: Sync + Send + 'static {
 
     /// 从 data_root 加载该 source 的全部数据。
     /// - `data_root`:指向 `exam-lookup` 项目根(包含 `banks/`、`crawl/`、`docs/` 等子目录)
-    fn load(&self, data_root: &Path) -> Result<Vec<LoadResult>, EngineError>;
+    ///
+    /// 错误语义(P0-1):
+    /// - `Err` —— source **整体**不可用(缺 `banks/` 目录等),调用方按 source 级失败处理
+    /// - `Ok(outcome)` —— source 可用;`outcome.issues` 是**逐文件**失败,不影响 `outcome.results`
+    fn load(&self, data_root: &Path) -> Result<LoadOutcome, EngineError>;
 }
 
 // ================ inventory 注册表 ================
@@ -204,8 +231,8 @@ mod tests {
             fn interval(&self) -> Interval {
                 Interval::Test
             }
-            fn load(&self, _: &Path) -> Result<Vec<LoadResult>, EngineError> {
-                Ok(vec![])
+            fn load(&self, _: &Path) -> Result<LoadOutcome, EngineError> {
+                Ok(LoadOutcome::default())
             }
         }
         static MOCK_INSTANCE: MockSource = MockSource;

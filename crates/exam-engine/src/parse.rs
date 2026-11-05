@@ -17,11 +17,15 @@ use crate::types::BankOption;
 /// `\s`，。、；：！？（）《》【】<>,.;:!?()[]"'’‘“”\-—_/\\|`
 ///
 /// 注意:Rust `char` 是 Unicode 标量值;`\u{2018}` 等是单 codepoint,直接比对。
+///
+/// P0-2 修复:原集合**漏了** `.`(半角句点)与 `。`(U+3002),
+/// 而 Python `_PUNC` 两者都有 → `norm("1. 这是题干？")` 在 Rust 是
+/// "1.这是题干"、在 Python 是 "1这是题干"。补齐后两边逐字一致。
 const PUNCT_CHARS: &[char] = &[
     ' ', '\t', '\r', '\n', // \s
     '\u{FF0C}', ',', // ，
-    '\u{3001}', '、',
-    '\u{FF1B}', ';', // ；
+    '\u{3002}', '.', // 。 .
+    '\u{3001}', '、', '\u{FF1B}', ';', // ；
     '\u{FF1A}', ':', // ：
     '\u{FF01}', '!', // ！
     '\u{FF1F}', '?', // ？
@@ -31,15 +35,45 @@ const PUNCT_CHARS: &[char] = &[
     '\u{300B}', '>', // 》
     '\u{3010}', '[', // 【
     '\u{3011}', ']', // 】
-    '"', '\'',
-    '\u{2018}', '\u{2019}', // ’‘
+    '"', '\'', '\u{2018}', '\u{2019}', // ’‘
     '\u{201C}', '\u{201D}', // “”
     '-', '\u{2014}', // — (em-dash)
     '_', '/', '\\', '|',
 ];
 
-/// `norm(s)`:把所有标点折叠成单空格,trim,再压缩连续空白。
+/// `norm(s)`:删除所有标点与空白 —— 严格对齐 Python `solve.py::norm`:
+/// ```python
+/// _PUNC = re.compile(r"[\s，。、；：！？（）《》【】<>,.;:!?()\[\]\"'’‘“”\-—_/\\|]+")
+/// def norm(s): return _PUNC.sub("", (s or "")).strip()
+/// ```
+///
+/// **不能**把标点折叠成空格(那是旧实现,已改):Python 端是「删除」,
+/// 而 `q` 表的 `nq` / `nqstem` 列在 Python(`qb.sqlite3`)与 Rust 两边
+/// schema 完全一致 —— 折叠成空格会让同一个库在两套系统里对不上
+/// (Python `lookup()` 用 `norm(question) == r[4]` 做精确命中)。
+///
+/// 空白也算标点:Python 的 `\s` 在 str 模式下匹配 Unicode 空白
+/// (U+3000 / U+00A0 等),Rust 用 `char::is_whitespace()` 对齐。
 pub fn norm(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if !is_punct(ch) {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// 把标点折叠成单空格 —— 只给 FTS 查询构造用。
+///
+/// 与 `norm` 的区别:SQLite FTS5 的 unicode61 分词器把标点当**分隔符**,
+/// 索引里 "hello,world" 是两个 token("hello" / "world")。查询串若按
+/// `norm` 删掉逗号会变成单个 token "helloworld",与索引对不上 → 查不到。
+/// 所以构造 MATCH 表达式时必须在标点处断开,这里把标点换成空格来断词。
+pub(crate) fn fold_punct_to_space(s: &str) -> String {
     if s.is_empty() {
         return String::new();
     }
@@ -78,130 +112,78 @@ fn collapse_whitespace(s: &str) -> String {
 }
 
 fn is_punct(ch: char) -> bool {
-    PUNCT_CHARS.contains(&ch)
+    // Python 的 `_PUNC` 里 `\s` 在 str 模式下匹配 Unicode 空白
+    // (U+3000 全角空格 / U+00A0 NBSP 等),`PUNCT_CHARS` 只列了 ASCII 空白 → 这里补齐。
+    PUNCT_CHARS.contains(&ch) || ch.is_whitespace()
 }
 
-/// `stem_of(s)`:从题干中剥掉选项标注,只剩真正的题干部分。
+/// `stem_of(s)`:剥掉选项块,只留题干 —— 严格对齐 Python `solve.py::stem_of`:
+/// ```python
+/// def stem_of(s):
+///     t = re.split(r"[（(]\s*[)）]\s*", s or "")[0]
+///     if norm(t) == norm(s):
+///         t = re.split(r"\s*A[.、．]\s*", s or "")[0]
+///     return t.strip()
+/// ```
 ///
-/// 1. 切掉前导题号(`1.` / `(1)` / `10、`)
-/// 2. 切掉 `(X)` 形式注解
-/// 3. 切掉 `A.` / `A、` / `A．` 选项前缀(可重复,直到不是选项前缀)
-/// 4. 剥掉尾部 `，。` 标点
+/// 语义:
+/// 1. 切掉**第一个空括号占位**(`（ ）` / `( )`,中间允许空白)之前的内容。
+///    注意只切**空**括号 —— `（简称涉密信息系统）` 这种带内容的括号要保留。
+/// 2. 若第 1 步没删掉实质内容(归一化后与原文相同)→ 再切「A. / A、/ A．」选项前缀。
+///
+/// P0-2 修复:旧实现是「切掉第一个 `(`/`（` 之后的所有内容 + 剥前导题号 +
+/// 剥尾部标点」,与 Python 无关 —— 例如「坚持（ ）对保守国家秘密工作的领导」
+/// 在 Rust 下只剩「坚持」,会让 `nqstem = ?` 精确命中退化成「任意以『坚持』开头
+/// 的题」,把无关题当成命中。
 pub fn stem_of(s: &str) -> String {
-    let s = s.trim();
     if s.is_empty() {
         return String::new();
     }
 
-    let mut t = strip_leading_question_number(s);
-
-    if let Some(idx) = t.find(['(', '\u{FF08}']) {
-        t = &t[..idx];
-    }
-
-    // 反复切选项前缀(`A. B. C.` 这种多层罕见但允许)
-    while let Some(rest) = strip_option_prefix(t) {
-        t = rest;
-    }
-
-    t.trim()
-        .trim_end_matches([',', '.', '\u{FF0C}', '\u{3002}'])
-        .trim()
-        .to_string()
-}
-
-fn strip_leading_question_number(s: &str) -> &str {
-    // 简化:`^[（(]?\s*[0-9〜~\-]{1,3}\s*[)）]?[、.．]?\s*`
-    // 全部用 char-aware 扫描,避免多字节 UTF-8 切错
-    let mut chars = s.char_indices().peekable();
-
-    // 可选 ASCII '('
-    if let Some(&(_, '(')) = chars.peek() {
-        chars.next();
-    }
-    // 可选空白
-    while let Some(&(_, c)) = chars.peek() {
-        if c == ' ' || c == '\t' {
-            chars.next();
-        } else {
-            break;
-        }
-    }
-
-    let num_start_byte = chars.peek().map(|(idx, _)| *idx).unwrap_or(s.len());
-    let mut seen = 0usize;
-    while seen < 3 {
-        match chars.peek() {
-            Some(&(_, c)) if c.is_ascii_digit() || c == '~' || c == '-' || c == '\u{301C}' => {
-                chars.next();
-                seen += 1;
-            }
-            _ => break,
-        }
-    }
-    if seen == 0 {
-        return s;
-    }
-
-    // 可选空白
-    while let Some(&(_, c)) = chars.peek() {
-        if c == ' ' || c == '\t' {
-            chars.next();
-        } else {
-            break;
-        }
-    }
-    // 可选 ')'
-    if let Some(&(_, ')')) = chars.peek() {
-        chars.next();
-    }
-    // 可选 [、.．]
-    if let Some(&(_, c)) = chars.peek() {
-        if c == ',' || c == '.' || c == '\u{3001}' || c == '\u{FF0E}' {
-            chars.next();
-        }
-    }
-    // 可选空白
-    while let Some(&(_, c)) = chars.peek() {
-        if c == ' ' || c == '\t' {
-            chars.next();
-        } else {
-            break;
-        }
-    }
-
-    let end_byte = chars.peek().map(|(idx, _)| *idx).unwrap_or(s.len());
-    if end_byte == num_start_byte {
-        s
+    let t = before_blank_paren(s);
+    let t = if norm(&t) == norm(s) {
+        // 注意:Python 这里切的是**原文** s,不是 t
+        before_option_prefix(s)
     } else {
-        &s[end_byte..]
-    }
+        t
+    };
+    t.trim().to_string()
 }
 
-fn strip_option_prefix(s: &str) -> Option<&str> {
-    let mut chars = s.chars();
-    let first = chars.next()?;
-    if !matches!(first, 'A'..='D' | 'a'..='d') {
-        return None;
+/// 第一个「空括号占位」(`（ ）` / `( )`)之前的内容;没有则返回原串。
+fn before_blank_paren(s: &str) -> String {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    for i in 0..chars.len() {
+        let (start, ch) = chars[i];
+        if ch != '(' && ch != '\u{FF08}' {
+            continue;
+        }
+        let mut j = i + 1;
+        while j < chars.len() && chars[j].1.is_whitespace() {
+            j += 1;
+        }
+        if j < chars.len() && (chars[j].1 == ')' || chars[j].1 == '\u{FF09}') {
+            return s[..start].to_string();
+        }
     }
-    let second = chars.next()?;
-    // 第二字符必须是 `.<space>?` 或 `、` / `．`
-    let after_sep = match second {
-        '.' => 2usize,
-        '\u{3001}' | '\u{FF0E}' => 2, // 跳过 A + 分隔符 = 2 个 char
-        _ => return None,
-    };
-    let start_byte = s
-        .char_indices()
-        .nth(after_sep)
-        .map(|(idx, _)| idx)
-        .unwrap_or(s.len());
-    let rest = &s[start_byte..];
-    let trimmed = rest.trim_start();
-    if trimmed.is_empty() {
-        return None;
+    s.to_string()
+}
+
+/// 第一个「A. / A、/ A．」选项前缀之前的内容;没有则返回原串。
+fn before_option_prefix(s: &str) -> String {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    for i in 0..chars.len() {
+        let (idx, ch) = chars[i];
+        if ch != 'A' {
+            continue;
+        }
+        if let Some(&(_, next)) = chars.get(i + 1) {
+            if next == '.' || next == '\u{3001}' || next == '\u{FF0E}' {
+                return s[..idx].to_string();
+            }
+        }
     }
-    Some(trimmed)
+    s.to_string()
 }
 
 /// 把 `Vec<String>` 答案文本用中文顿号 `、` 拼接(对齐 Python `solve.py::build`)。
@@ -287,7 +269,10 @@ pub fn parse_options(question: &str) -> Option<Vec<(char, String)>> {
             }
             j += 1;
         }
-        let end_byte = chars.get(end).map(|(idx, _)| *idx).unwrap_or(question.len());
+        let end_byte = chars
+            .get(end)
+            .map(|(idx, _)| *idx)
+            .unwrap_or(question.len());
 
         let text = question[start_byte..end_byte].trim_end();
         if !text.is_empty() {
@@ -333,13 +318,57 @@ pub fn norm_borrowed(s: &str) -> Cow<'_, str> {
 mod tests {
     use super::*;
 
+    /// P0-2 回归:`norm` 必须与 Python `solve.py::norm` **逐字一致**(删除标点,
+    /// 不是折叠成空格)。期望值直接取自 Python 端的 `_PUNC.sub("", s).strip()`。
+    ///
+    /// 旧实现把标点折叠成空格("hello world"),Python 端是 "helloworld" ——
+    /// `q` 表 `nq` / `nqstem` 两边 schema 一致,值不一致会让 Python 的
+    /// `lookup()`(`norm(question) == r[4]` 精确命中)对 Rust 建的库全部落空。
     #[test]
     fn norm_strips_punctuation() {
-        assert_eq!(norm("hello,world!"), "hello world");
-        assert_eq!(norm("你好,世界!"), "你好 世界");
-        assert_eq!(norm("a, b,,c"), "a b c");
+        assert_eq!(norm("hello,world!"), "helloworld");
+        assert_eq!(norm("你好,世界!"), "你好世界");
+        assert_eq!(norm("a, b,,c"), "abc");
         assert_eq!(norm(""), "");
         assert_eq!(norm("plain"), "plain");
+    }
+
+    /// 与 Python `solve.py::norm` 的**跨语言契约**测试。
+    ///
+    /// 期望值全部由 Python 端实跑产出(见 scripts/dump_banks.py 的 `norm`),
+    /// 任何一边改了标点集合或空白处理,这个测试就会红。
+    #[test]
+    fn norm_matches_python_reference_exactly() {
+        let cases: &[(&str, &str)] = &[
+            ("hello,world!", "helloworld"),
+            ("a  b\t\tc", "abc"),
+            ("答:AB", "答AB"),
+            ("A、B、C", "ABC"),
+            (
+                "新修订的《中华人民共和国保守国家秘密法》新增和修改的内容不包括（ ）",
+                "新修订的中华人民共和国保守国家秘密法新增和修改的内容不包括",
+            ),
+            ("题干(X) 后面", "题干X后面"),
+            ("", ""),
+            ("   ", ""),
+            ("1. 这是题干？", "1这是题干"),
+            ("中\u{3000}国", "中国"), // 全角空格:Python 的 \s 匹配 Unicode 空白
+            ("a\"b", "ab"),
+            ("第一， 第二。 第三！", "第一第二第三"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(&norm(input), expected, "norm({input:?}) 与 Python 不一致");
+        }
+    }
+
+    /// FTS 查询构造用的折叠版:标点 → 空格(unicode61 分词器把标点当分隔符,
+    /// 查询串必须在标点处断词,否则 "hello,world" 变成单 token 查不到)。
+    #[test]
+    fn fold_punct_to_space_keeps_token_boundaries() {
+        assert_eq!(fold_punct_to_space("hello,world!"), "hello world");
+        assert_eq!(fold_punct_to_space("a, b,,c"), "a b c");
+        assert_eq!(fold_punct_to_space("答:AB"), "答 AB");
+        assert_eq!(fold_punct_to_space(""), "");
     }
 
     /// Step 3.2 (2026-10-12):基本 CJK 串词间插空格(主路径)
@@ -389,35 +418,41 @@ mod tests {
 
     #[test]
     fn norm_collapses_whitespace() {
-        assert_eq!(norm("a  b\t\tc"), "a b c");
-        assert_eq!(norm("  leading and trailing  "), "leading and trailing");
+        // Python 端把空白一起删掉(`\s` 在 `_PUNC` 字符类里)→ 不是折叠,是删除
+        assert_eq!(norm("a  b\t\tc"), "abc");
+        assert_eq!(norm("  leading and trailing  "), "leadingandtrailing");
     }
 
     #[test]
     fn norm_handles_chinese_punctuation() {
         // 答:AB / A、B、C / (双引号“内”)
-        assert_eq!(norm("答:AB"), "答 AB");
-        assert_eq!(norm("A、B、C"), "A B C");
-        assert_eq!(norm("\u{201C}双引号\u{201D}内"), "双引号 内");
+        assert_eq!(norm("答:AB"), "答AB");
+        assert_eq!(norm("A、B、C"), "ABC");
+        assert_eq!(norm("\u{201C}双引号\u{201D}内"), "双引号内");
     }
 
+    /// P0-2 回归:带内容的括号**不切**,只切空括号占位(`（ ）`)。
     #[test]
-    fn stem_of_strips_parenthesized_annotations() {
-        assert_eq!(stem_of("题干(X)"), "题干");
-        assert_eq!(stem_of("题干 (注) 后面"), "题干");
+    fn stem_of_keeps_parenthesized_content() {
+        // Python 只切「空括号」——`（注）` 有内容,原样保留
+        assert_eq!(stem_of("题干(X)"), "题干(X)");
+        assert_eq!(stem_of("题干 (注) 后面"), "题干 (注) 后面");
     }
 
     #[test]
     fn stem_of_strips_option_prefix() {
-        assert_eq!(stem_of("A. 这是选项"), "这是选项");
-        assert_eq!(stem_of("A、也是选项"), "也是选项");
+        // Python `re.split(r"\s*A[.、．]\s*", s)[0]` → 切在 A 之前,选项本身也被切掉
+        assert_eq!(stem_of("A. 这是选项"), "");
+        assert_eq!(stem_of("A、也是选项"), "");
+        assert_eq!(stem_of("题干A.内容"), "题干");
     }
 
+    /// P0-2 回归:Python **不剥**前导题号(旧 Rust 实现会剥)。
     #[test]
-    fn stem_of_strips_leading_question_number() {
-        assert_eq!(stem_of("1. 题干开始"), "题干开始");
-        assert_eq!(stem_of("10、题干"), "题干");
-        assert_eq!(stem_of("(1) 题干"), "题干");
+    fn stem_of_keeps_leading_question_number() {
+        assert_eq!(stem_of("1. 题干开始"), "1. 题干开始");
+        assert_eq!(stem_of("10、题干"), "10、题干");
+        assert_eq!(stem_of("(1) 题干"), "(1) 题干");
     }
 
     #[test]
@@ -426,11 +461,50 @@ mod tests {
         assert_eq!(stem_of("   "), "");
     }
 
+    /// P0-2 回归:Python **不剥**尾部标点(旧 Rust 实现会剥)。
     #[test]
-    fn stem_of_chinese_full_stops() {
-        // Python `re.sub(r"[，。,.]*$", "", s)` 只剥尾标点,中间逗号保留
-        assert_eq!(stem_of("这是题干,后面带逗号。"), "这是题干,后面带逗号");
-        assert_eq!(stem_of("题干尾部.,"), "题干尾部");
+    fn stem_of_keeps_trailing_punctuation() {
+        assert_eq!(stem_of("这是题干,后面带逗号。"), "这是题干,后面带逗号。");
+        assert_eq!(stem_of("题干尾部.,"), "题干尾部.,");
+    }
+
+    /// 与 Python `solve.py::stem_of` 的**跨语言契约**测试。
+    ///
+    /// 期望值全部由 Python 端实跑产出 —— 任何一边改了切分规则,这个测试就会红。
+    #[test]
+    fn stem_of_matches_python_reference_exactly() {
+        let cases: &[(&str, &str)] = &[
+            ("题干(X)", "题干(X)"),
+            ("题干 (注) 后面", "题干 (注) 后面"),
+            ("A. 这是选项", ""),
+            ("A、也是选项", ""),
+            ("1. 题干开始", "1. 题干开始"),
+            ("10、题干", "10、题干"),
+            ("(1) 题干", "(1) 题干"),
+            ("", ""),
+            ("   ", ""),
+            ("这是题干,后面带逗号。", "这是题干,后面带逗号。"),
+            ("题干尾部.,", "题干尾部.,"),
+            (
+                "坚持（ ）对保守国家秘密工作的领导。中央保密工作领导机构。",
+                "坚持",
+            ),
+            (
+                "存储、处理国家秘密的计算机信息系统（简称涉密信息系统）按照涉密程度实行（ ）。",
+                "存储、处理国家秘密的计算机信息系统（简称涉密信息系统）按照涉密程度实行（ ）。",
+            ),
+            ("（ ）工作应党而生、伴党而行。", ""),
+            ("1. 这是题干？", "1. 这是题干？"),
+            ("A. 选项一 B. 选项二", ""),
+            ("题干A.内容", "题干"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                &stem_of(input),
+                expected,
+                "stem_of({input:?}) 与 Python 不一致"
+            );
+        }
     }
 
     #[test]

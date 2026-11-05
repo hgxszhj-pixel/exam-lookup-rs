@@ -9,3 +9,6 @@
 *.log
 .idea/
 .vscode/
+
+# oh-my-claudecode 本地状态目录(agent 会话 / checkpoint / HUD 缓存)
+.omc/

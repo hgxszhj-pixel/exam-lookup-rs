@@ -16,7 +16,7 @@
 use rusqlite::{params, Connection};
 
 use crate::error::{EngineError, Result};
-use crate::parse::{norm, stem_of};
+use crate::parse::{fold_punct_to_space, norm, stem_of};
 
 /// 搜索结果单条。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -120,9 +120,7 @@ fn try_stem_exact(conn: &Connection, text: &str) -> Result<Option<SearchHit>> {
         return Ok(None);
     }
     let mut stmt = conn
-        .prepare_cached(
-            "SELECT id, src, question, answer FROM q WHERE nqstem = ? LIMIT 1",
-        )
+        .prepare_cached("SELECT id, src, question, answer FROM q WHERE nqstem = ? LIMIT 1")
         .map_err(|e| EngineError::other(format!("prepare stem exact: {e}")))?;
     let mut rows = stmt
         .query(params![stem])
@@ -132,8 +130,12 @@ fn try_stem_exact(conn: &Connection, text: &str) -> Result<Option<SearchHit>> {
         .map_err(|e| EngineError::other(format!("next row: {e}")))?
     {
         Ok(Some(SearchHit {
-            id: row.get(0).map_err(|e| EngineError::other(format!("col 0: {e}")))?,
-            src: row.get(1).map_err(|e| EngineError::other(format!("col 1: {e}")))?,
+            id: row
+                .get(0)
+                .map_err(|e| EngineError::other(format!("col 0: {e}")))?,
+            src: row
+                .get(1)
+                .map_err(|e| EngineError::other(format!("col 1: {e}")))?,
             question: row
                 .get(2)
                 .map_err(|e| EngineError::other(format!("col 2: {e}")))?,
@@ -153,10 +155,14 @@ fn try_fts(conn: &Connection, q: &SearchQuery) -> Result<Vec<SearchHit>> {
     if fts_term.is_empty() {
         return Ok(Vec::new());
     }
+    // JOIN 条件用 `rowid` 而不是 `id`:
+    // `q_fts.rowid == q.rowid` 是 1:1 映射(见 `index.rs::insert_load_result`),
+    // 而 `id` 在跨 bank 时会重复 —— 用 `id` join 就会一对多扇出,
+    // 同一条命中重复返回,`LIMIT 16` 实际只给 8 个不同问题(P1-1)。
     let mut stmt = conn
         .prepare(
             "SELECT q.id, q.src, q.question, q.answer, bm25(q_fts) \
-             FROM q_fts JOIN q ON q.id = q_fts.id \
+             FROM q_fts JOIN q ON q.rowid = q_fts.rowid \
              WHERE q_fts MATCH ? AND (? IS NULL OR q.src = ?) \
              ORDER BY bm25(q_fts) LIMIT ?",
         )
@@ -167,7 +173,10 @@ fn try_fts(conn: &Connection, q: &SearchQuery) -> Result<Vec<SearchHit>> {
         .query(params![fts_term, bank, bank, q.limit as i64])
         .map_err(|e| EngineError::other(format!("query fts: {e}")))?;
     let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| EngineError::other(format!("row: {e}")))? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| EngineError::other(format!("row: {e}")))?
+    {
         out.push(mapper(row).map_err(|e| EngineError::other(format!("map: {e}")))?);
     }
     Ok(out)
@@ -182,7 +191,7 @@ fn try_like(conn: &Connection, q: &SearchQuery) -> Result<Vec<SearchHit>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, src, question, answer, 0.0 FROM q \
-             WHERE nq LIKE ? AND (? IS NULL OR src = ?) \
+             WHERE nq LIKE ? ESCAPE '\\' AND (? IS NULL OR src = ?) \
              ORDER BY length(nq) LIMIT ?",
         )
         .map_err(|e| EngineError::other(format!("prepare like: {e}")))?;
@@ -192,7 +201,10 @@ fn try_like(conn: &Connection, q: &SearchQuery) -> Result<Vec<SearchHit>> {
         .query(params![like_pat, bank, bank, q.limit as i64])
         .map_err(|e| EngineError::other(format!("query like: {e}")))?;
     let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| EngineError::other(format!("row: {e}")))? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| EngineError::other(format!("row: {e}")))?
+    {
         out.push(mapper(row).map_err(|e| EngineError::other(format!("map: {e}")))?);
     }
     Ok(out)
@@ -230,10 +242,11 @@ fn try_fts_card(conn: &Connection, q: &SearchQuery) -> Result<Vec<CardHit>> {
     if fts_term.is_empty() {
         return Ok(Vec::new());
     }
+    // 同 `try_fts`:`card_fts.rowid == card.rowid` 是 1:1 映射,用 rowid join 不会扇出。
     let mut stmt = conn
         .prepare(
             "SELECT card.id, card.src, card.title, card.body, bm25(card_fts) \
-             FROM card_fts JOIN card ON card.id = card_fts.id \
+             FROM card_fts JOIN card ON card.rowid = card_fts.rowid \
              WHERE card_fts MATCH ? \
              ORDER BY bm25(card_fts) LIMIT ?",
         )
@@ -261,7 +274,7 @@ fn try_like_card(conn: &Connection, q: &SearchQuery) -> Result<Vec<CardHit>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, src, title, body, 0.0 FROM card \
-             WHERE title LIKE ? OR body LIKE ? \
+             WHERE title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\' \
              ORDER BY length(title) LIMIT ?",
         )
         .map_err(|e| EngineError::other(format!("prepare like card: {e}")))?;
@@ -279,7 +292,9 @@ fn try_like_card(conn: &Connection, q: &SearchQuery) -> Result<Vec<CardHit>> {
     Ok(out)
 }
 
-fn map_card_hit(kind: MatchKind) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> rusqlite::Result<CardHit> {
+fn map_card_hit(
+    kind: MatchKind,
+) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> rusqlite::Result<CardHit> {
     move |row| {
         Ok(CardHit {
             id: row.get(0)?,
@@ -292,7 +307,9 @@ fn map_card_hit(kind: MatchKind) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> ru
     }
 }
 
-fn map_hit(kind: MatchKind) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> rusqlite::Result<SearchHit> {
+fn map_hit(
+    kind: MatchKind,
+) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> rusqlite::Result<SearchHit> {
     move |row| {
         let id: String = row.get(0)?;
         let src: String = row.get(1)?;
@@ -321,7 +338,10 @@ fn map_hit(kind: MatchKind) -> impl for<'a> Fn(&'a rusqlite::Row<'a>) -> rusqlit
 /// - 单/双 ASCII 字符 → `"<char>"`(精确)
 /// - CJK 字符 → 每个字一个 token `"<字>"`(unicode61 索引也是按字)
 fn build_fts_term(text: &str) -> String {
-    let normalized = norm(text);
+    // 用 fold_punct_to_space(不是 norm):unicode61 把标点当分隔符,
+    // 查询串必须在标点处断词,否则 "hello,world" 会变成单 token "helloworld",
+    // 与索引里的两个 token 对不上。
+    let normalized = fold_punct_to_space(text);
     if normalized.is_empty() {
         return String::new();
     }
@@ -388,9 +408,18 @@ fn is_cjk(ch: char) -> bool {
     )
 }
 
+/// 转义 LIKE 模式里的通配符。
+///
+/// **必须配合 SQL 里的 `ESCAPE '\'` 子句** —— SQLite 默认把 `\` 当普通字面量,
+/// 没有 ESCAPE 时 `%a\%b\_c%` 匹配不到字面值 `a%b_c`(实测:含 `100%` 的题干
+/// 永远查不到)。顺序不能换:先转义 `\` 自身,再转义 `%` / `_`。
+///
+/// 注:`norm()` 会删掉 `_` 和 `\`(它们在 Python `_PUNC` 里),所以实际能漏到
+/// 这里的通配符主要是 `%`。
 fn escape_like(s: &str) -> String {
-    // SQLite LIKE 默认 escape 关闭;转义 `%` `_` `\`
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 #[cfg(test)]
@@ -432,11 +461,15 @@ mod tests {
     #[test]
     fn like_fallback_for_substring() {
         let conn = fixture();
-        // 中文短词可能被 unicode61 切得太细,触发 LIKE 兜底
-        let q = SearchQuery::new("密码").with_limit(5);
-        let hits = search(&conn, &q).unwrap();
-        assert!(!hits.is_empty(), "至少 LIKE 兜底命中");
+        // 直接调 try_like —— 走 search() 的话 FTS 先命中,这个测试就钉不住兜底路径
+        // (旧写法:即使**整个删掉 try_like**,该测试照样通过)。
+        let hits = try_like(&conn, &SearchQuery::new("密码").with_limit(5)).unwrap();
+        assert!(!hits.is_empty(), "LIKE 兜底应命中");
         assert!(hits.iter().any(|h| h.question.contains("密码")));
+        assert!(
+            hits.iter().all(|h| h.match_kind == MatchKind::Like),
+            "兜底路径的 kind 必须是 Like"
+        );
     }
 
     #[test]
@@ -452,9 +485,70 @@ mod tests {
     #[test]
     fn bank_filter_narrows_results() {
         let conn = fixture();
-        let q = SearchQuery::new("网络").with_bank("a.json");
+        // bank id 是文件名去后缀(`a.json` → `a`),旧测试写 "a.json" → 过滤不中任何行,
+        // `all()` 在空集合上恒真 —— 测试其实什么都没验。
+        let q = SearchQuery::new("网络").with_bank("a");
         let hits = search(&conn, &q).unwrap();
-        assert!(hits.iter().all(|h| h.src == "a.json"));
+        assert!(!hits.is_empty(), "过滤到 bank 'a' 应有命中");
+        assert!(hits.iter().all(|h| h.src == "a"));
+    }
+
+    /// 两个 bank 用同一批 question id(真实数据:1768 题里 129 个 id 跨 bank 重复)。
+    fn cross_bank_fixture() -> Connection {
+        let dir = tempfile::tempdir().unwrap();
+        let banks = dir.path().join("banks");
+        std::fs::create_dir_all(&banks).unwrap();
+        for (bank, title) in [("a.json", "A"), ("b.json", "B")] {
+            std::fs::write(
+                banks.join(bank),
+                format!(
+                    r#"{{
+                        "meta": {{"title": "{title}"}},
+                        "questions": [
+                            {{"id":"dup-1","number":1,"type":"single","question":"网络安全基础","answerKeys":["A"]}},
+                            {{"id":"dup-2","number":2,"type":"single","question":"网络安全进阶","answerKeys":["B"]}}
+                        ]
+                    }}"#
+                ),
+            )
+            .unwrap();
+        }
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::index::build_with_source(&mut conn, &JsonBanksSource, dir.path()).unwrap();
+        conn
+    }
+
+    /// P1-1 回归:FTS 命中不得重复返回同一条问题。
+    ///
+    /// 修复前:`q` 单列主键 + REPLACE(跨 bank 同 id 互相顶掉)、`q_fts` 普通 INSERT
+    /// (不去重)→ `JOIN q ON q.id = q_fts.id` 一对多扇出 → 同一条命中出现两次,
+    /// `LIMIT 16` 实际只给 8 个不同问题。
+    #[test]
+    fn fts_search_returns_each_question_once() {
+        let conn = cross_bank_fixture();
+        let hits = search(&conn, &SearchQuery::new("网络安全").with_limit(16)).unwrap();
+        assert_eq!(hits.len(), 4, "2 bank × 2 题都应命中");
+
+        let mut keys: Vec<(String, String)> =
+            hits.iter().map(|h| (h.src.clone(), h.id.clone())).collect();
+        keys.sort();
+        let before = keys.len();
+        keys.dedup();
+        assert_eq!(keys.len(), before, "同一条命中不应重复返回(P1-1 扇出)");
+    }
+
+    /// P1-1 回归:`LIMIT` 必须作用在**不同问题**上。
+    /// 修复前:limit=16 只给 8 个不同问题(另一半是重复行)。
+    #[test]
+    fn limit_counts_distinct_questions() {
+        let conn = cross_bank_fixture();
+        let hits = search(&conn, &SearchQuery::new("网络安全").with_limit(2)).unwrap();
+        assert_eq!(hits.len(), 2, "limit=2 应返回 2 行");
+        let mut keys: Vec<(String, String)> =
+            hits.iter().map(|h| (h.src.clone(), h.id.clone())).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 2, "limit=2 应给出 2 个不同问题");
     }
 
     #[test]
@@ -488,6 +582,51 @@ mod tests {
     #[test]
     fn escape_like_handles_wildcards() {
         assert_eq!(escape_like("a%b_c"), "a\\%b\\_c");
+    }
+
+    /// P1-2 回归:LIKE 兜底必须真的把通配符当字面量。
+    ///
+    /// 修复前:`escape_like` 输出了反斜杠转义,但两条 LIKE 查询都**没有 `ESCAPE '\'`**
+    /// —— SQLite 无 ESCAPE 时把 `\` 当普通字面量 → 模式 `%100\%%` 匹配不到字面值
+    /// `100%`(实测:含 `100%` 的题永远查不到)。旧测试只断言转义后的字符串,
+    /// **从不验证 SQL 是否匹配** —— 整个转义机制坏掉,测试照绿。
+    #[test]
+    fn like_fallback_treats_percent_as_literal() {
+        let conn = percent_fixture();
+        // 直接调 try_like:走 search() 的话 FTS 会先命中,钉不住兜底路径
+        // (旧测试 `like_fallback_for_substring` 就是这么"测"的 —— 删掉 try_like 它照样绿)。
+        let hits = try_like(&conn, &SearchQuery::new("100%").with_limit(10)).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "字面量 '100%' 应命中含百分号的那一题(修复前 0 条)"
+        );
+        assert!(hits[0].question.contains("100%"));
+
+        // 反向:不存在的字面量不该命中任何题
+        let none = try_like(&conn, &SearchQuery::new("999%").with_limit(10)).unwrap();
+        assert!(none.is_empty(), "'999%' 不该命中任何题");
+    }
+
+    /// 含 `%` 字面量的题干 + 一道干扰题。
+    fn percent_fixture() -> Connection {
+        let dir = tempfile::tempdir().unwrap();
+        let banks = dir.path().join("banks");
+        std::fs::create_dir_all(&banks).unwrap();
+        std::fs::write(
+            banks.join("pct.json"),
+            r#"{
+                "meta": {"title": "百分号"},
+                "questions": [
+                    {"id":"p-1","number":1,"type":"single","question":"增长率100%的计算方法","answerKeys":["A"]},
+                    {"id":"p-2","number":2,"type":"single","question":"增长率100元的计算方法","answerKeys":["B"]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::index::build_with_source(&mut conn, &JsonBanksSource, dir.path()).unwrap();
+        conn
     }
 
     // ================ Phase G: search_cards() ================

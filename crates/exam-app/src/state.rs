@@ -51,9 +51,7 @@ impl Theme {
 /// Desktop 启动时 + Settings 保存后各调一次。
 pub fn apply_theme_to_root(theme: Theme) {
     let script = match theme.data_attr() {
-        Some(v) => format!(
-            r#"document.documentElement.setAttribute('data-theme','{v}');"#
-        ),
+        Some(v) => format!(r#"document.documentElement.setAttribute('data-theme','{v}');"#),
         None => r#"document.documentElement.removeAttribute('data-theme');"#.to_string(),
     };
     let _ = dioxus::document::eval(&script);
@@ -109,9 +107,35 @@ fn default_settings_path() -> PathBuf {
 pub enum DbStatus {
     #[default]
     Unloaded,
-    Ready { questions: usize },
+    Ready {
+        questions: usize,
+    },
     Error(String),
 }
+
+/// watcher 消费线程的**代际**句柄(P1-3)。
+///
+/// 代际独立:每一代线程拥有**自己的**停止标志 `Arc<AtomicBool>`。
+///
+/// 修复前的 bug(P1-3):所有代共用 `watcher_enabled` 一个 `AtomicBool`。
+/// `stop_watcher` 把它置 `false` 后,紧接着的 `ensure_watcher` 又置回 `true` ——
+/// 旧代线程的 `while enabled.load()` 再次为真 → **旧代复活**,
+/// 继续用**旧的 data_root** 重建索引,把新一代的结果覆盖掉。
+///
+/// 现在:停旧代只置**旧代自己**的标志;旧代一定退出由 `stop_watcher` 的 join 保证。
+pub struct WatcherSlot {
+    /// 本代专属停止标志:`false` → 该代线程退出消费循环。
+    stop: Arc<AtomicBool>,
+    /// 线程句柄。`stop_watcher` **真正 join**(不是 detach):
+    /// 保证"旧代完全退出"之后调用方才可能启新一代。
+    join: JoinHandle<()>,
+}
+
+/// watcher 消费线程的 poll 周期。
+///
+/// 同时也是 `stop_watcher` 的 join 延迟上界(线程最迟一个周期后看到停止标志)。
+/// 500ms → 100ms:停止延迟从半秒降到百毫秒级,文件事件检测延迟同样可接受。
+const WATCHER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// 全局应用状态 — 通过 `provide_context` 注入子树。
 ///
@@ -129,10 +153,12 @@ pub struct AppState {
     pub db_status: Arc<RwLock<DbStatus>>,
     /// Phase M:防并发 rebuild — 用户点按钮 + watcher 线程 + bootstrap 同时只一个跑。
     pub rebuild_lock: Arc<Mutex<()>>,
-    /// Phase M:watcher 消费线程句柄。`Option::None` = 未启动;`Some` = 已 spawn,Drop 线程继续跑。
-    /// 停止通过 `watcher_enabled` 标志(消费线程每 500ms 检查一次)。
-    pub watcher: Arc<Mutex<Option<JoinHandle<()>>>>,
-    /// Phase M:watcher 启用开关。`true` = 消费线程继续 `rx.recv_timeout`;`false` = 退出循环。
+    /// watcher 消费线程的**当前代**(`None` = 未启动)。见 [`WatcherSlot`]:停止是**代际独立**的。
+    pub watcher: Arc<Mutex<Option<WatcherSlot>>>,
+    /// UI 指示:当前是否有 watcher 在跑。
+    ///
+    /// **不是**线程的停止标志 —— 停止标志是每代私有的(见 [`WatcherSlot::stop`]);
+    /// 共享标志会让"停旧代 + 启新代"复活旧代(P1-3)。
     pub watcher_enabled: Arc<AtomicBool>,
 }
 
@@ -154,7 +180,9 @@ impl AppState {
         let status = match Connection::open(&db_path) {
             Ok(c) => {
                 let s = match count_questions(&c) {
-                    Ok(n) => DbStatus::Ready { questions: n as usize },
+                    Ok(n) => DbStatus::Ready {
+                        questions: n as usize,
+                    },
                     Err(e) => DbStatus::Error(format!("读取 DB 失败:{e}")),
                 };
                 if let Ok(mut g) = db.lock() {
@@ -165,7 +193,7 @@ impl AppState {
             Err(e) => DbStatus::Error(format!("打开 DB 失败:{} ({e})", db_path.display())),
         };
         let rebuild_lock = Arc::new(Mutex::new(()));
-        let watcher: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+        let watcher: Arc<Mutex<Option<WatcherSlot>>> = Arc::new(Mutex::new(None));
         let watcher_enabled = Arc::new(AtomicBool::new(false));
         let state = Self {
             settings: Arc::new(RwLock::new(settings)),
@@ -189,7 +217,12 @@ impl AppState {
         state
     }
 
-    pub fn search(&self, query: &str, bank: Option<&str>, limit: usize) -> Result<Vec<SearchHit>, String> {
+    pub fn search(
+        &self,
+        query: &str,
+        bank: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>, String> {
         let guard = self.db.lock().map_err(|e| e.to_string())?;
         let conn = guard.as_ref().ok_or_else(|| "DB 未就绪".to_string())?;
         let mut q = SearchQuery::new(query).with_limit(limit);
@@ -230,7 +263,10 @@ impl AppState {
 
     #[allow(dead_code)]
     pub fn db_status_snapshot(&self) -> DbStatus {
-        self.db_status.read().map(|s| s.clone()).unwrap_or(DbStatus::Unloaded)
+        self.db_status
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or(DbStatus::Unloaded)
     }
 
     /// 从 `data_root`(bank JSON + crawl 目录)重建索引到 `db_path`。
@@ -240,11 +276,7 @@ impl AppState {
     ///
     /// Phase M:用 `rebuild_lock.try_lock()` 防并发 — 用户点按钮 + watcher 线程 + bootstrap
     /// 同时只一个能跑。锁不上立即返 Err,UI 显示"重建中…"(而不是阻塞 UI 线程)。
-    pub fn rebuild_index(
-        &self,
-        data_root: &Path,
-        db_path: &Path,
-    ) -> Result<BuildStats, String> {
+    pub fn rebuild_index(&self, data_root: &Path, db_path: &Path) -> Result<BuildStats, String> {
         let _guard = self
             .rebuild_lock
             .try_lock()
@@ -275,7 +307,9 @@ impl AppState {
 
         // 4. 写 db_status = Ready{N}
         if let Ok(mut s) = self.db_status.write() {
-            *s = DbStatus::Ready { questions: stats.questions };
+            *s = DbStatus::Ready {
+                questions: stats.questions,
+            };
         }
         Ok(stats)
     }
@@ -287,18 +321,19 @@ impl AppState {
     /// 流程:
     /// 1. 检查 `self.watcher` slot,已 Some → 早返
     /// 2. 读当前 settings.data_root,调 `engine::watcher::watch()` 创 OS watcher
-    /// 3. spawn std::thread 消费 `rx.recv_timeout(500ms)` 循环,每次事件触发 `rebuild_index`
-    /// 4. 存 JoinHandle 进 slot
+    /// 3. spawn std::thread 消费 `rx.recv_timeout(WATCHER_POLL_INTERVAL)` 循环,每次事件触发 `rebuild_index`
+    /// 4. 存 [`WatcherSlot`]{stop 标志 + 线程句柄} 进 slot
     ///
     /// 失败(目录消失 / data_root 不存在)→ 返 Err,**不** panic。
     #[allow(dead_code)] // Step 3 SettingsPage 调
     pub fn ensure_watcher(&self) -> Result<(), String> {
-        // 1. 幂等检查
-        {
-            let guard = self.watcher.lock().map_err(|e| e.to_string())?;
-            if guard.is_some() {
-                return Ok(());
-            }
+        // 1. 幂等检查 —— 全程持锁直到 slot 填好。
+        //    旧实现"检查后释放锁、再 spawn、再加锁写 slot"存在 double-spawn 竞态:
+        //    并发调用时后到的会顶掉先到的 handle,被顶掉的线程既没人 join 也没人能停
+        //    → 变成永久孤儿线程(它的停止标志永远不会被置 false)。
+        let mut slot = self.watcher.lock().map_err(|e| e.to_string())?;
+        if slot.is_some() {
+            return Ok(());
         }
 
         // 2. 读当前 data_root (snapshot 一次,启动期固定;Step 3 会接 settings 变化重启)
@@ -311,33 +346,53 @@ impl AppState {
         let watcher = exam_engine::watcher::watch(&data_root, Duration::from_millis(300))
             .map_err(|e| format!("启动 data_root 监听失败 ({}): {e}", data_root.display()))?;
 
-        // 4. 启消费线程
-        self.watcher_enabled.store(true, Ordering::Relaxed);
+        // 4. 启消费线程 —— 停止标志**每代独有**(P1-3):
+        //    停旧代只置旧代自己的标志,启新代不会把旧代"复活"。
+        let stop = Arc::new(AtomicBool::new(true));
+        let stop_in_thread = Arc::clone(&stop);
         let state_clone = self.clone();
-        let enabled = Arc::clone(&self.watcher_enabled);
         let join = std::thread::Builder::new()
             .name("data-root-watcher".into())
-            .spawn(move || watcher_consumer_loop(state_clone, watcher, enabled, data_root, db_path))
+            .spawn(move || {
+                watcher_consumer_loop(state_clone, watcher, stop_in_thread, data_root, db_path)
+            })
             .map_err(|e| format!("spawn watcher 线程失败: {e}"))?;
 
-        let mut slot = self.watcher.lock().map_err(|e| e.to_string())?;
-        // 极小概率:并发 ensure_watcher 都通过 is_none 检查 → 后到的覆盖先到 handle。
-        // 先到的线程正在跑,后到的 handle 引用是"旧"线程;为简单用 swap,丢弃旧的(它的 enabled=true,
-        // 不会再被触发因新启的也 set true;但老线程因 rx 仍 valid 会继续跑 — 浪费而已)。
-        // Step 3 加 UI 防抖不需此处理,因为 UI 端串行触发。
-        *slot = Some(join);
+        *slot = Some(WatcherSlot { stop, join });
+        self.watcher_enabled.store(true, Ordering::Relaxed);
         Ok(())
     }
 
-    /// 停止 watcher 消费线程:置 enabled=false,JoinHandle 从 slot take(线程最迟 500ms 后退出)。
+    /// 停止 watcher 消费线程:置**本代**停止标志为 false,并**真正 join** 线程。
     ///
-    /// 注意:仅停止消费循环,OS watcher 在 `DataRootWatcher` Drop 时(线程退出时)自动停。
+    /// 修复前(P1-3):只是把 handle 从 slot take 掉 → 线程 detach 继续跑,
+    /// 且共享的 `watcher_enabled` 会被下一代重新置 true → 旧代复活,
+    /// 用旧 data_root 重建索引覆盖新索引。
+    ///
+    /// 现在:join 保证"旧代完全退出"之后调用方才可能启下一代。
+    /// 注意 join 最多阻塞一个 poll 周期(见 [`WATCHER_POLL_INTERVAL`]),
+    /// 或等当前正在跑的重建结束 —— 因此 UI 侧应在**后台线程**调用本方法。
     #[allow(dead_code)] // Step 3 SettingsPage 调
     pub fn stop_watcher(&self) {
+        // UI 状态立即置 false(不等 join,免得 UI 以为还在跑)
         self.watcher_enabled.store(false, Ordering::Relaxed);
-        if let Ok(mut slot) = self.watcher.lock() {
-            // Option::take → 线程句柄被 drop,线程 detach 继续跑(直至 enabled=false + 500ms timeout)
-            *slot = None;
+
+        // take 出 slot —— **先释放锁再 join**:持锁等线程会挡住 ensure_watcher
+        let taken = match self.watcher.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(e) => {
+                tracing::warn!(error = %e, "stop_watcher: 取 watcher slot 失败");
+                None
+            }
+        };
+        let Some(slot) = taken else { return };
+
+        // 只停**这一代**:置本代专属标志 → 新一代的标志不受影响,旧代也回不来
+        slot.stop.store(false, Ordering::Relaxed);
+
+        // 真正 join(旧实现是 detach —— 旧线程继续跑)
+        if slot.join.join().is_err() {
+            tracing::warn!("watcher 消费线程 panic(已 join)");
         }
     }
 
@@ -354,6 +409,9 @@ impl AppState {
     /// - `enabled=false` → `stop_watcher`
     ///
     /// 失败仅 `tracing::warn!`,UI 仍可正常用。
+    ///
+    /// 注意:`stop_watcher` 会 join 旧线程 → 本方法**可能阻塞**(最多一个 poll 周期,
+    /// 或当前正在跑的重建的剩余时间)。UI 侧应在后台线程调用(见 `ui/settings.rs`)。
     #[allow(dead_code)] // Step M+ SettingsPage 保存按钮调
     pub fn sync_watcher(&self, enabled: bool) {
         if enabled {
@@ -367,25 +425,25 @@ impl AppState {
     }
 }
 
-/// Phase M:watcher 消费线程函数 — `rx.recv_timeout(500ms)` 循环,事件触发 rebuild_index。
+/// Phase M:watcher 消费线程函数 — `rx.recv_timeout(WATCHER_POLL_INTERVAL)` 循环,事件触发 rebuild_index。
 ///
 /// 参数:
 /// - `state`:AppState clone(Arc 字段共享锁)
 /// - `watcher`:DataRootWatcher 持有 OS watcher + 接收端
-/// - `enabled`:停止标志
+/// - `stop`:**本代专属**停止标志(P1-3 —— 共享标志会让旧代被新一代复活)
 /// - `data_root` / `db_path`:snapshot 启动时的路径(Step 3 接 settings 变化重启时再 snapshot)
 #[allow(dead_code)] // Step 3 SettingsPage 调 ensure_watcher 时被引用
 fn watcher_consumer_loop(
     state: AppState,
     watcher: DataRootWatcher,
-    enabled: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     data_root: PathBuf,
     db_path: PathBuf,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
     tracing::info!(data_root = %data_root.display(), "watcher 消费线程启动");
-    while enabled.load(Ordering::Relaxed) {
-        match watcher.rx.recv_timeout(Duration::from_millis(500)) {
+    while stop.load(Ordering::Relaxed) {
+        match watcher.rx.recv_timeout(WATCHER_POLL_INTERVAL) {
             Ok(_event) => {
                 // 重建 — 用 try_lock;锁不上(用户正在手动重建)skip,下次事件会再试
                 match state.rebuild_index(&data_root, &db_path) {
@@ -411,7 +469,7 @@ fn watcher_consumer_loop(
             }
         }
     }
-    tracing::info!("watcher_enabled=false,消费线程退出");
+    tracing::info!("watcher 停止标志置位,消费线程退出");
     // watcher 在此 Drop → OS watcher 停 → 监听结束
 }
 
@@ -627,7 +685,10 @@ mod tests {
             ..Default::default()
         };
         let s = AppState::bootstrap_from(settings);
-        assert!(s.is_watcher_enabled(), "auto_rebuild=true → bootstrap 启 watcher");
+        assert!(
+            s.is_watcher_enabled(),
+            "auto_rebuild=true → bootstrap 启 watcher"
+        );
         assert!(s.watcher.lock().unwrap().is_some());
         s.stop_watcher(); // 清理
     }
@@ -643,7 +704,10 @@ mod tests {
             ..Default::default()
         };
         let s = AppState::bootstrap_from(settings);
-        assert!(!s.is_watcher_enabled(), "auto_rebuild=false → bootstrap 不启 watcher");
+        assert!(
+            !s.is_watcher_enabled(),
+            "auto_rebuild=false → bootstrap 不启 watcher"
+        );
         assert!(s.watcher.lock().unwrap().is_none());
     }
 
@@ -689,7 +753,10 @@ mod tests {
         // sync_watcher(true) → 强制重启,新线程监听 dir_b
         s.sync_watcher(true);
         assert!(s.is_watcher_enabled(), "sync(true) 后 enabled=true");
-        assert!(s.watcher.lock().unwrap().is_some(), "sync(true) 后 slot 仍 Some(新 handle)");
+        assert!(
+            s.watcher.lock().unwrap().is_some(),
+            "sync(true) 后 slot 仍 Some(新 handle)"
+        );
 
         // 清理
         s.stop_watcher();
@@ -709,5 +776,154 @@ mod tests {
         s.sync_watcher(false);
         assert!(!s.is_watcher_enabled(), "sync(false) 后 enabled=false");
         assert!(s.watcher.lock().unwrap().is_none());
+    }
+
+    // ── P1-3:watcher 代际隔离 + 真正 join ──────────────────────────────
+
+    /// 写一个最小 bank JSON 到 `<root>/banks/<name>.json`。
+    fn write_bank(root: &Path, name: &str, stem: &str) {
+        let banks = root.join("banks");
+        std::fs::create_dir_all(&banks).expect("mkdir banks");
+        let json = format!(
+            r#"{{"meta": {{"title": "{name}"}}, "questions": [{{"id": "{name}-1", "number": 1, "type": "single", "question": "{stem}", "answerKeys": ["A"]}}]}}"#
+        );
+        std::fs::write(banks.join(format!("{name}.json")), json).expect("write bank");
+    }
+
+    /// 当前 DB 的 `q` 表里是否有题干包含 `needle` 的题。
+    fn db_has_question(state: &AppState, needle: &str) -> bool {
+        let Ok(guard) = state.db.lock() else {
+            return false;
+        };
+        let Some(conn) = guard.as_ref() else {
+            return false;
+        };
+        conn.query_row(
+            "SELECT count(*) FROM q WHERE question LIKE ?1",
+            [format!("%{needle}%")],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// 轮询直到 `f` 为真或超时。
+    fn wait_until<F: FnMut() -> bool>(mut f: F, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        f()
+    }
+
+    /// P1-3 回归:停旧代 + 启新代后,**旧代不得复活**。
+    ///
+    /// 修复前:所有代共用 `watcher_enabled` 一个 `AtomicBool`。
+    /// `stop_watcher` 置 false → `ensure_watcher` 置回 true → 旧代线程的
+    /// `while enabled.load()` 又为真 → 旧代继续用**旧 data_root** 重建索引,
+    /// 把新一代的结果覆盖掉(用户改了 data_root,索引却被"旧路径"顶回来)。
+    ///
+    /// 本测试用真实 FS 事件驱动:切到新 data_root 之后,旧 data_root 的改动
+    /// **不应**再触发任何重建。
+    #[test]
+    fn old_watcher_generation_does_not_rebuild_after_restart() {
+        let dir_a = tempfile::tempdir().expect("A");
+        let dir_b = tempfile::tempdir().expect("B");
+        let db_path = dir_a.path().join("idx.db");
+
+        write_bank(dir_a.path(), "a", "AAA 题干");
+        write_bank(dir_b.path(), "b", "BBB 题干");
+
+        let settings = AppSettings {
+            data_root: dir_a.path().to_path_buf(),
+            db_path,
+            auto_rebuild: false,
+            ..Default::default()
+        };
+        let s = AppState::bootstrap_from(settings);
+        s.ensure_watcher().expect("gen1 启动");
+
+        // gen1 监听 A → 改 A → 应重建出 "AAA 题干"
+        write_bank(dir_a.path(), "a2", "AAA 题干");
+        assert!(
+            wait_until(|| db_has_question(&s, "AAA 题干"), Duration::from_secs(15)),
+            "gen1 应被 A 的文件变化触发重建"
+        );
+
+        // 切到 B → 强制重启 watcher(gen2 监听 B)
+        {
+            let mut g = s.settings.write().expect("settings lock");
+            g.data_root = dir_b.path().to_path_buf();
+        }
+        s.sync_watcher(true);
+        assert!(s.is_watcher_enabled(), "sync(true) 后 watcher 应在跑");
+
+        // gen2 监听 B → 改 B → 重建来源应是 B(DB 里不再有 A 的题)
+        write_bank(dir_b.path(), "b2", "BBB 题干");
+        assert!(
+            wait_until(|| db_has_question(&s, "BBB 题干"), Duration::from_secs(15)),
+            "gen2 应被 B 的文件变化触发重建"
+        );
+        assert!(
+            !db_has_question(&s, "AAA 题干"),
+            "重建来源应是 B —— DB 里不该再有 A 的题"
+        );
+
+        // 关键回归:改**旧** data_root A ——
+        // 旧代若复活,会用 A 重建,把新索引顶掉(旧实现必红)。
+        write_bank(dir_a.path(), "a3", "AAA 题干");
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            !db_has_question(&s, "AAA 题干"),
+            "旧代复活了:旧 data_root 的改动触发了重建(P1-3 未修)"
+        );
+
+        s.stop_watcher();
+    }
+
+    /// P1-3 契约:`stop_watcher` 返回时,旧代线程必须**已经退出**(真正 join,不是 detach)。
+    ///
+    /// 探针:消费线程持有 `AppState` 副本 → 线程退出才会 drop 掉那份副本,
+    /// `Arc::strong_count(&state.db)` 才会回落到基线。
+    ///
+    /// 修复前:`stop_watcher` 只把 handle 从 slot take 掉 → 线程 detach 继续跑;
+    /// 且共享的 `watcher_enabled` 被新一代置回 true → 旧代**永远**活着
+    /// → strong_count 永远多 1 → 红。
+    #[test]
+    fn stop_watcher_joins_the_previous_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = AppState::bootstrap_from(AppSettings {
+            data_root: dir.path().to_path_buf(),
+            db_path: dir.path().join("idx.db"),
+            auto_rebuild: false,
+            ..Default::default()
+        });
+        let base = Arc::strong_count(&s.db);
+
+        s.ensure_watcher().expect("gen1");
+        assert_eq!(
+            Arc::strong_count(&s.db),
+            base + 1,
+            "消费线程应持有 AppState 副本"
+        );
+
+        // 停旧代 + 启新代:此时活着的消费线程应**只有**新代
+        s.stop_watcher();
+        s.ensure_watcher().expect("gen2");
+        assert_eq!(
+            Arc::strong_count(&s.db),
+            base + 1,
+            "旧代必须已 join 退出(否则它还活着 → 会用旧 data_root 覆盖新索引)"
+        );
+
+        s.stop_watcher();
+        assert_eq!(
+            Arc::strong_count(&s.db),
+            base,
+            "全部停完后不应有任何消费线程存活"
+        );
     }
 }

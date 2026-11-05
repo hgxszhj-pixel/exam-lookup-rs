@@ -14,7 +14,7 @@
 
 use crate::error::{EngineError, Result};
 use crate::source::Interval;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -132,6 +132,45 @@ CREATE TABLE IF NOT EXISTS cache_meta (
 CREATE INDEX IF NOT EXISTS idx_cache_meta_status ON cache_meta(status);
 ";
 
+/// 把一行 `cache_meta` 映射成 `CacheEntry`。
+///
+/// **status 分两种情况处理**(P2-7):
+///
+/// 1. 写时是 `Expired` → 这是 scheduler 的**失败标记**(`scheduler.rs` 的 tick 错误分支
+///    写 `status: Expired`),必须保留 —— 不能被"按 age 重算"抹掉,
+///    否则 UI/CLI 就看不出"上次 load 失败"。
+/// 2. 写时是 `Fresh`/`Stale` → 上次 load 成功 → status 按**读取时刻**重算
+///    (`compute_status(fetched_at, ttl_secs, now)`)。
+///    DB 里存的是"写入那一刻"的状态,时间一走它就过期了;
+///    直接读出来会让 `exam-cli cache list` 把一小时前写的条目报成 fresh,
+///    `should_refresh`(依赖 status)也拿到过期的判断依据。
+///
+/// 判据成立的原因:scheduler 成功时写 `compute_status(now, ttl, now)` = `Fresh`
+/// (age=0 < ttl,所有 `Interval` 的 ttl ≥ 1s),失败时写 `Expired`。
+///
+/// 列顺序与 `SELECT` 一致:0=source_id 1=fetched_at 2=ttl_secs 3=status
+/// 4=banks 5=questions 6=notes。
+fn row_to_entry(row: &rusqlite::Row<'_>, now: i64) -> rusqlite::Result<CacheEntry> {
+    let fetched_at: i64 = row.get(1)?;
+    let ttl_secs: u64 = row.get::<_, i64>(2)? as u64;
+    let stored = CacheStatus::parse(&row.get::<_, String>(3)?).unwrap_or(CacheStatus::Expired);
+    let status = match stored {
+        // 写时的失败标记 —— 保留
+        CacheStatus::Expired => CacheStatus::Expired,
+        // 上次成功 → 按读取时刻重算
+        _ => compute_status(fetched_at, ttl_secs, now),
+    };
+    Ok(CacheEntry {
+        source_id: row.get(0)?,
+        fetched_at,
+        ttl_secs,
+        status,
+        banks: row.get::<_, i64>(4)? as usize,
+        questions: row.get::<_, i64>(5)? as usize,
+        notes: row.get(6)?,
+    })
+}
+
 /// SQLite-backed cache store(独立 cache.db)。
 ///
 /// **Threading contract (Step 0.1, 2026-10-12)**:
@@ -159,9 +198,8 @@ impl CacheStore {
 
     /// 内存 cache(测试用)。
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory().map_err(|e| {
-            EngineError::schema("<in-memory cache>", e.to_string())
-        })?;
+        let conn = Connection::open_in_memory()
+            .map_err(|e| EngineError::schema("<in-memory cache>", e.to_string()))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| EngineError::schema("<in-memory schema>", e.to_string()))?;
         Ok(Self { conn })
@@ -194,6 +232,7 @@ impl CacheStore {
     }
 
     pub fn get(&self, source_id: &str) -> Result<Option<CacheEntry>> {
+        let now = now_secs();
         let mut stmt = self
             .conn
             .prepare(
@@ -202,24 +241,14 @@ impl CacheStore {
             )
             .map_err(|e| EngineError::schema("<cache get>", e.to_string()))?;
         let row = stmt
-            .query_row(params![source_id], |r| {
-                let status_s: String = r.get(3)?;
-                Ok(CacheEntry {
-                    source_id: r.get(0)?,
-                    fetched_at: r.get(1)?,
-                    ttl_secs: r.get::<_, i64>(2)? as u64,
-                    status: CacheStatus::parse(&status_s).ok().unwrap_or(CacheStatus::Expired),
-                    banks: r.get::<_, i64>(4)? as usize,
-                    questions: r.get::<_, i64>(5)? as usize,
-                    notes: r.get(6)?,
-                })
-            })
+            .query_row(params![source_id], |r| row_to_entry(r, now))
             .optional()
             .map_err(|e| EngineError::schema("<cache get>", e.to_string()))?;
         Ok(row)
     }
 
     pub fn list(&self) -> Result<Vec<CacheEntry>> {
+        let now = now_secs();
         let mut stmt = self
             .conn
             .prepare(
@@ -228,18 +257,7 @@ impl CacheStore {
             )
             .map_err(|e| EngineError::schema("<cache list>", e.to_string()))?;
         let rows = stmt
-            .query_map([], |r| {
-                let status_s: String = r.get(3)?;
-                Ok(CacheEntry {
-                    source_id: r.get(0)?,
-                    fetched_at: r.get(1)?,
-                    ttl_secs: r.get::<_, i64>(2)? as u64,
-                    status: CacheStatus::parse(&status_s).ok().unwrap_or(CacheStatus::Expired),
-                    banks: r.get::<_, i64>(4)? as usize,
-                    questions: r.get::<_, i64>(5)? as usize,
-                    notes: r.get(6)?,
-                })
-            })
+            .query_map([], |r| row_to_entry(r, now))
             .map_err(|e| EngineError::schema("<cache list>", e.to_string()))?;
         let mut out = Vec::new();
         for row in rows {
@@ -349,9 +367,10 @@ mod tests {
     #[test]
     fn cache_store_roundtrip_in_memory() {
         let store = CacheStore::open_in_memory().unwrap();
+        let now = now_secs();
         let entry = CacheEntry {
             source_id: "json_banks".into(),
-            fetched_at: 1000,
+            fetched_at: now,
             ttl_secs: 3600,
             status: CacheStatus::Fresh,
             banks: 16,
@@ -360,38 +379,82 @@ mod tests {
         };
         store.upsert(&entry).unwrap();
         let got = store.get("json_banks").unwrap().unwrap();
-        assert_eq!(got, entry);
+        assert_eq!(got, entry, "刚写入就读取:字段与 status 都应一致");
 
         // 更新覆盖
         let mut updated = entry.clone();
-        updated.fetched_at = 2000;
+        updated.fetched_at = now - 1800; // 30 分钟前(ttl=3600 → 仍是 fresh)
         updated.status = CacheStatus::Stale;
         updated.questions = 1761;
         store.upsert(&updated).unwrap();
-        assert_eq!(store.get("json_banks").unwrap().unwrap(), updated);
+        let got2 = store.get("json_banks").unwrap().unwrap();
+        assert_eq!(got2.source_id, updated.source_id);
+        assert_eq!(got2.fetched_at, updated.fetched_at);
+        assert_eq!(got2.questions, updated.questions);
+        assert_eq!(
+            got2.status,
+            CacheStatus::Fresh,
+            "status 按读取时刻重算(age=1800 < ttl=3600),不是读 DB 里存的那个 stale"
+        );
 
         // list 排序
-        store.upsert(&CacheEntry {
-            source_id: "other".into(),
-            fetched_at: 500,
-            ttl_secs: 60,
-            status: CacheStatus::Expired,
-            banks: 1,
-            questions: 5,
-            notes: None,
-        }).unwrap();
+        store
+            .upsert(&CacheEntry {
+                source_id: "other".into(),
+                fetched_at: 500,
+                ttl_secs: 60,
+                status: CacheStatus::Expired,
+                banks: 1,
+                questions: 5,
+                notes: None,
+            })
+            .unwrap();
         let list = store.list().unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].source_id, "json_banks");
         assert_eq!(list[1].source_id, "other");
     }
 
+    /// P2-7 回归:status 必须**按读取时刻**算,不能直接返回 DB 里存的旧值。
+    ///
+    /// 修复前:`get` / `list` 直接返回写入时存下的 status → 一条 ttl=60 的
+    /// 条目写完 1 小时后再读,仍然报 `fresh` → `exam-cli cache list` 骗用户,
+    /// `should_refresh`(依赖 status)也拿到过期的判断依据。
+    #[test]
+    fn cache_status_is_recomputed_at_read_time() {
+        let store = CacheStore::open_in_memory().unwrap();
+        let now = now_secs();
+        store
+            .upsert(&CacheEntry {
+                source_id: "stale_but_stored_fresh".into(),
+                fetched_at: now - 3600,     // 1 小时前
+                ttl_secs: 60,               // ttl 1 分钟
+                status: CacheStatus::Fresh, // 写入那一刻确实是 fresh
+                banks: 1,
+                questions: 1,
+                notes: None,
+            })
+            .unwrap();
+
+        let got = store.get("stale_but_stored_fresh").unwrap().unwrap();
+        assert_eq!(
+            got.status,
+            CacheStatus::Expired,
+            "读时必须按 now 重算(DB 里存的还是 fresh)"
+        );
+
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].status,
+            CacheStatus::Expired,
+            "list 同样必须按 now 重算"
+        );
+    }
+
     #[test]
     fn cache_store_persists_to_disk() {
-        let tmp = std::env::temp_dir().join(format!(
-            "exam-cache-{}.db",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("exam-cache-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
 
         let store = CacheStore::open(&tmp).unwrap();
@@ -419,24 +482,28 @@ mod tests {
     #[test]
     fn cache_store_delete_and_clear() {
         let store = CacheStore::open_in_memory().unwrap();
-        store.upsert(&CacheEntry {
-            source_id: "a".into(),
-            fetched_at: 0,
-            ttl_secs: 60,
-            status: CacheStatus::Fresh,
-            banks: 0,
-            questions: 0,
-            notes: None,
-        }).unwrap();
-        store.upsert(&CacheEntry {
-            source_id: "b".into(),
-            fetched_at: 0,
-            ttl_secs: 60,
-            status: CacheStatus::Fresh,
-            banks: 0,
-            questions: 0,
-            notes: None,
-        }).unwrap();
+        store
+            .upsert(&CacheEntry {
+                source_id: "a".into(),
+                fetched_at: 0,
+                ttl_secs: 60,
+                status: CacheStatus::Fresh,
+                banks: 0,
+                questions: 0,
+                notes: None,
+            })
+            .unwrap();
+        store
+            .upsert(&CacheEntry {
+                source_id: "b".into(),
+                fetched_at: 0,
+                ttl_secs: 60,
+                status: CacheStatus::Fresh,
+                banks: 0,
+                questions: 0,
+                notes: None,
+            })
+            .unwrap();
 
         store.delete("a").unwrap();
         assert!(store.get("a").unwrap().is_none());

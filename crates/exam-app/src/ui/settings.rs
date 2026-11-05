@@ -1,12 +1,18 @@
 //! SettingsPage:主题 / data root / db path 设置 + 持久化 + 重建索引(Phase H)。
 
-use crate::state::{AppSettings, AppState, DbStatus, Theme, apply_theme_to_root, save_settings};
+use crate::state::{apply_theme_to_root, save_settings, AppSettings, AppState, DbStatus, Theme};
 use dioxus::prelude::*;
+use futures_channel::oneshot;
 
 #[component]
 pub fn SettingsPage() -> Element {
     let state = use_context::<AppState>();
-    let current = state.settings.read().ok().map(|s| s.clone()).unwrap_or_default();
+    let current = state
+        .settings
+        .read()
+        .ok()
+        .map(|s| s.clone())
+        .unwrap_or_default();
     let mut data_root = use_signal(|| current.data_root.to_string_lossy().to_string());
     let mut db_path = use_signal(|| current.db_path.to_string_lossy().to_string());
     let mut theme = use_signal(|| current.theme);
@@ -130,11 +136,16 @@ pub fn SettingsPage() -> Element {
                             move |e| {
                                 let next = e.value() == "true";
                                 auto_rebuild.set(next);
-                                if next {
-                                    let _ = state.ensure_watcher();
-                                } else {
-                                    state.stop_watcher();
-                                }
+                                // P1-3:watcher 停/启会 join 旧线程(最多阻塞一个 poll 周期,
+                                // 或当前正在跑的重建的剩余时间)→ 放后台线程,别卡 UI。
+                                let state_bg = state.clone();
+                                std::thread::spawn(move || {
+                                    if next {
+                                        let _ = state_bg.ensure_watcher();
+                                    } else {
+                                        state_bg.stop_watcher();
+                                    }
+                                });
                             }
                         },
                     }
@@ -168,8 +179,11 @@ pub fn SettingsPage() -> Element {
                                     if let Ok(mut g) = state.settings.write() {
                                         *g = new_settings.clone();
                                     }
-                                    // Phase M+:data_root 变化时强制重启 watcher,使监听新路径
-                                    state.sync_watcher(new_settings.auto_rebuild);
+                                    // Phase M+:data_root 变化时强制重启 watcher,使监听新路径。
+                                    // P1-3:`sync_watcher` 会 join 旧线程 → 放后台线程,别卡 UI。
+                                    let watcher_state = state.clone();
+                                    let auto = new_settings.auto_rebuild;
+                                    std::thread::spawn(move || watcher_state.sync_watcher(auto));
                                     last_msg.set(Some("已保存(主题立即生效;auto_rebuild 开时 data_root 变化自动重启 watcher)".into()));
                                 }
                                 Err(e) => last_msg.set(Some(e)),
@@ -196,16 +210,36 @@ pub fn SettingsPage() -> Element {
                                     return;
                                 }
                             };
-                            match state.rebuild_index(&root, &dbp) {
-                                Ok(stats) => {
-                                    rebuild_msg.set(Some(format!(
-                                        "重建完成:banks={} questions={} cards={} errors={}",
-                                        stats.banks, stats.questions, stats.cards, stats.errors
-                                    )));
-                                }
-                                Err(e) => rebuild_msg.set(Some(e)),
+                            // P1-4:重建是 IO 密集(读全部题库 JSON + 写 SQLite)→ 放**后台 OS 线程**。
+                            // 旧实现直接在 UI 线程同步重建:
+                            //   1) 窗口全程无响应(拿不到事件、不重绘);
+                            //   2) `rebuilding.set(true)` 与 `set(false)` 在同一个同步回调里,
+                            //      中间没有让出点 → "重建中…" 永远渲染不出来。
+                            let state_bg = state.clone();
+                            let (tx, rx) = oneshot::channel::<String>();
+                            if let Err(e) = std::thread::Builder::new()
+                                .name("manual-rebuild".into())
+                                .spawn(move || {
+                                    let msg = match state_bg.rebuild_index(&root, &dbp) {
+                                        Ok(stats) => format!(
+                                            "重建完成:banks={} questions={} cards={} errors={}",
+                                            stats.banks, stats.questions, stats.cards, stats.errors
+                                        ),
+                                        Err(e) => e,
+                                    };
+                                    let _ = tx.send(msg);
+                                }) {
+                                rebuild_msg.set(Some(format!("重建线程启动失败:{e}")));
+                                rebuilding.set(false);
+                                return;
                             }
-                            rebuilding.set(false);
+                            // 结果回到 **UI 线程** 再更新 signal —— signal 只能在 UI 线程写,
+                            // 否则不会触发重渲染。
+                            dioxus::prelude::spawn(async move {
+                                let msg = rx.await.unwrap_or_else(|_| "重建线程异常退出".into());
+                                rebuild_msg.set(Some(msg));
+                                rebuilding.set(false);
+                            });
                         }
                     },
                     if rebuilding() { "重建中…" } else { "重建索引" }
@@ -268,7 +302,10 @@ mod ssr_tests {
         assert!(html.contains("设置"), "页面标题 '设置' 必须出现");
         assert!(html.contains("data_root 题库目录"), "data_root 标签");
         assert!(html.contains("db_path 索引文件"), "db_path 标签");
-        assert!(html.contains("data_root 变化时自动重建索引"), "auto_rebuild 卡片");
+        assert!(
+            html.contains("data_root 变化时自动重建索引"),
+            "auto_rebuild 卡片"
+        );
         assert!(html.contains("保存"), "保存按钮");
         assert!(html.contains("重建索引"), "重建按钮");
 

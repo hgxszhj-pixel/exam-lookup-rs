@@ -1,5 +1,10 @@
 # R-COVERAGE 覆盖率报告(Phase F 80% 验收)
 
+> **这是 Phase F 的验收快照(基线 2026-10-04),不是当前覆盖率报告。**
+> 当前可复算的事实见文末 [§ 当前状态(2026-11-04)](#当前状态2026-11-04)。
+> 本文的每文件 LOC / 测试数 / 覆盖度**都是当时的估算**,后续开发已使其过期 —— 保留是为了留档
+> "Phase F 的 80% 门槛是**怎么**判定的",不要拿它当今天的数字读。
+
 ## 工具尝试
 | 工具 | 结果 |
 |---|---|
@@ -10,9 +15,12 @@
 
 ## 降级方案:手工覆盖率估算
 
-### 输入数据
+### 输入数据(Phase F 快照)
 - 总 Rust 代码量:**4,670 行**(19 个 `.rs` 文件)
-- 测试函数:**78 个**(集成 `#[test]` 函数)
+  - ⚠ **这份数不可自洽复算**:下面的分模块表只列了 15 个文件,行数相加 = 4,035;
+    表里写的"纯逻辑 3,265"(引擎 3,091 + wrongbook 199 = 3,290)和"GUI 745"(对得上)也对不上 4,670。
+    差额来自未列入表的 4 个文件(benches / examples / `main.rs` 等)+ 每文件 LOC 本身是估算。**别当精确数用。**
+- 测试函数:**78 个**(集成 `#[test]` 函数)—— **Phase F 当时**;当前见文末 § 当前状态
 - 测试代码占代码比:目标 ≥ 30%(经验值映射到 ≥ 80% 行覆盖)
 
 ### 分模块评估
@@ -58,3 +66,29 @@
 ## 状态
 - Phase F 验收通过(纯逻辑维度)
 - GUI 测试留作 Phase F+(需要 Playwright + WebView 集成)
+
+---
+
+## 当前状态(2026-11-04)
+
+以下都是**可复算的硬数字**(不像上面的覆盖度百分比 —— 那是估算):
+
+| 维度 | 数值 | 怎么复算 |
+|---|---|---|
+| 测试总数 | **153 passed** | `cargo test --workspace` |
+| ├ exam-engine | 130 | `cargo test -p exam-engine` |
+| ├ exam-app | 23 | `cargo test -p exam-app` |
+| └ exam-cli | 0 | `cargo test -p exam-cli`(**CLI 目前零测试**,R-015 parity 靠 `scripts/` 兜) |
+| `.rs` 文件数 | **27**(tracked) | `git ls-files 'crates/*.rs' 'crates/**/*.rs'` |
+| `.rs` 总行数 | **8,862**(含 `#[cfg(test)]` 模块 / benches / examples) | 同上 × `wc -l` |
+| clippy | 0 error | `cargo clippy --workspace --all-targets -- -D warnings` |
+| fmt | clean | `cargo fmt --all -- --check` |
+| 真实数据 | 22 banks / 1768 Q / 1278 cards / 0 errors | `cargo run --bin exam-cli -- index --data-root ~/x_videos-dowloads/exam-lookup --out /tmp/x.db --rebuild` |
+
+**相比 Phase F 快照的变化**:测试 78 → **153**(+75);源码 19 文件 / 4,670 行 → 27 文件 / 8,862 行(+8 文件 +4,192 行)。
+
+**仍未做**:
+1. **真正的行覆盖率从未测过** —— `cargo-llvm-cov` / `cargo-tarpaulin` 在本机都跑不通(见 § 工具尝试),
+   所以"80%"始终是**按模块估算**,不是工具测出来的。补测需本地 `cargo install cargo-llvm-cov`。
+2. **exam-cli 零测试** —— CLI 的参数解析 / 分派没有单测,回归全靠 `scripts/` 里的手工脚本。
+3. **GUI 无自动化测试** —— 只有 2 个 `dioxus-ssr` 结构化 render test(SettingsPage),其余靠烟测。

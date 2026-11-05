@@ -103,8 +103,7 @@ fn main() -> Result<()> {
     // `.ok()` swallows "already initialized" errors (e.g. test harnesses).
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .try_init()
         .ok();
@@ -174,24 +173,28 @@ fn load_source(source_id: &str, data_root: &Path, filter: Option<&str>) -> Resul
         .ok_or_else(|| anyhow::anyhow!(EngineError::SourceNotFound(source_id.to_string())))?;
 
     let filter_lower = filter.map(|f| f.to_ascii_lowercase());
-    let results = src.load(data_root)?;
+    let outcome = src.load(data_root)?;
 
     println!(
         "{}: 加载 {} 个 bank(来自 {})",
         src.id(),
-        results.len(),
+        outcome.results.len(),
         data_root.display()
     );
 
+    // 文件级失败:非致命,但必须让用户看见(P0-1)
+    for issue in &outcome.issues {
+        eprintln!("  ! 跳过 {}: {}", issue.path.display(), issue.message);
+    }
+
     let mut total = 0usize;
-    for r in &results {
+    for r in &outcome.results {
         let bank_str = r.bank_id.as_str();
         let title = r.meta.as_ref().map(|m| m.title.as_str()).unwrap_or("");
         let hit = filter_lower
             .as_ref()
             .map(|f| {
-                bank_str.to_ascii_lowercase().contains(f)
-                    || title.to_ascii_lowercase().contains(f)
+                bank_str.to_ascii_lowercase().contains(f) || title.to_ascii_lowercase().contains(f)
             })
             .unwrap_or(true);
 
@@ -294,9 +297,12 @@ fn run_dump(data_root: &Path, out: &Path) -> Result<()> {
     let mut total_q = 0usize;
     let src_count = sources.len();
     for s in &sources {
-        let results = s.load(data_root)?;
+        let outcome = s.load(data_root)?;
+        for issue in &outcome.issues {
+            eprintln!("! 跳过 {}: {}", issue.path.display(), issue.message);
+        }
         let mut banks = serde_json::Map::new();
-        for r in results {
+        for r in outcome.results {
             let entry = serde_json::json!({
                 "meta": r.meta,
                 "questions": r.questions.iter().map(|q| {
@@ -427,11 +433,7 @@ fn run_scheduler(cache: &Path, data_root: &Path, seconds: u64) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_secs(seconds));
         stop_clone.store(true, std::sync::atomic::Ordering::Relaxed);
     });
-    let outcomes = sched.run_loop_for(
-        data_root,
-        std::time::Duration::from_secs(seconds),
-        stop,
-    );
+    let outcomes = sched.run_loop_for(data_root, std::time::Duration::from_secs(seconds), stop);
     println!("run 完成:{} 次 tick outcome", outcomes.len());
     Ok(())
 }

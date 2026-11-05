@@ -51,8 +51,16 @@ pub fn Shell(on_help_toggle: EventHandler<MouseEvent>) -> Element {
 #[component]
 fn DbStatusBadge(status: DbStatus) -> Element {
     let (color, text, title) = match &status {
-        DbStatus::Unloaded => ("var(--muted)", "DB: 未加载".to_string(), "尚未尝试加载".to_string()),
-        DbStatus::Ready { questions } => ("var(--success)", format!("DB: 就绪 ({questions} 题)"), format!("题数 {questions}")),
+        DbStatus::Unloaded => (
+            "var(--muted)",
+            "DB: 未加载".to_string(),
+            "尚未尝试加载".to_string(),
+        ),
+        DbStatus::Ready { questions } => (
+            "var(--success)",
+            format!("DB: 就绪 ({questions} 题)"),
+            format!("题数 {questions}"),
+        ),
         DbStatus::Error(e) => ("var(--danger)", "DB: 错误".to_string(), e.clone()),
     };
     rsx! {

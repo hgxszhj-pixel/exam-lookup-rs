@@ -59,11 +59,14 @@ trigram 中文分词(R-001):Rust 无现成 crate,降级方案是 "CJK 字符间�
 
 ```bash
 $ cargo run --bin exam-cli -- sources
-已注册 source (1):
+已注册 source (2):
   - json_banks           本地 JSON 题库           interval=slow (60min)
+  - crawl_cards          问答材料 JSON (crawl/问答*.json) interval=slow (60min)
 ```
 
-第二 source `crawl_cards` (问答 split) 已落 `source/crawl_cards.rs`,Phase G 启用。Phase 后可继续扩 `doc_index` (PDF/HTML,R-002 延后)。
+两个 source 都在各自文件里用 `inventory::submit!` 注册(`source/json_banks.rs` / `source/crawl_cards.rs`),
+`source/mod.rs` 只负责 trait + `Interval` + 注册表查询 —— 加新 source 时**不需要改 `mod.rs`**
+(只有新文件需要加 `pub mod xxx;` 一行)。后续可继续扩 `doc_index` (PDF/HTML,R-002 延后)。
 
 ## 引擎不变式
 

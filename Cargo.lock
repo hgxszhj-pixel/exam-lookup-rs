@@ -136,6 +136,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "askama_escape"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3df27b8d5ddb458c5fb1bbc1ce172d4a38c614a97d550b0ac89003897fb01de4"
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1174,6 +1180,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dioxus-ssr"
+version = "0.7.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4544ecf908962909de403bfdf94f771b036e9e1857e371cd3279841a15a892e6"
+dependencies = [
+ "askama_escape",
+ "dioxus-core",
+ "dioxus-core-types",
+ "rustc-hash 2.1.3",
+]
+
+[[package]]
 name = "dioxus-stores"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1451,8 +1469,10 @@ dependencies = [
  "dioxus",
  "dioxus-router",
  "dioxus-router-macro",
+ "dioxus-ssr",
  "dirs 5.0.1",
  "exam-engine",
+ "futures-channel",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3058,7 +3078,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

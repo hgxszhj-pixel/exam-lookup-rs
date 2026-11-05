@@ -29,7 +29,7 @@
 //! 简化:用 `contains("问答") && ends_with(".json")` 匹配,排除 `*.bak`。
 
 use crate::error::EngineError;
-use crate::source::{LoadResult, Source, SourceEntry};
+use crate::source::{LoadIssue, LoadOutcome, LoadResult, Source, SourceEntry};
 use crate::types::{BankId, CardItem};
 use std::path::Path;
 
@@ -57,7 +57,7 @@ impl Source for CrawlCardsSource {
         crate::source::Interval::Slow
     }
 
-    fn load(&self, data_root: &Path) -> Result<Vec<LoadResult>, EngineError> {
+    fn load(&self, data_root: &Path) -> Result<LoadOutcome, EngineError> {
         let crawl_dir = data_root.join(SUBDIR);
         if !crawl_dir.is_dir() {
             return Err(EngineError::schema(
@@ -69,12 +69,21 @@ impl Source for CrawlCardsSource {
             ));
         }
 
-        let entries =
-            std::fs::read_dir(&crawl_dir).map_err(|e| EngineError::io(&crawl_dir, e))?;
+        let entries = std::fs::read_dir(&crawl_dir).map_err(|e| EngineError::io(&crawl_dir, e))?;
         let mut results = Vec::new();
+        let mut issues = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|e| EngineError::io(&crawl_dir, e))?;
-            let path = entry.path();
+            let path = match entry {
+                Ok(e) => e.path(),
+                Err(e) => {
+                    issues.push(LoadIssue {
+                        source_id: ID.to_string(),
+                        path: crawl_dir.clone(),
+                        message: format!("read_dir entry: {e}"),
+                    });
+                    continue;
+                }
+            };
 
             // 只处理 .json 后缀且文件名含「问答」,跳过 .bak
             let fname = match path.file_name().and_then(|s| s.to_str()) {
@@ -93,14 +102,23 @@ impl Source for CrawlCardsSource {
                 .to_string();
             let bank_id = BankId(stem);
 
-            let result = load_one_card_file(&path, bank_id)?;
-            if !result.cards.is_empty() {
-                results.push(result);
+            // 逐文件隔离(P0-1):坏文件记 issue 后 continue
+            match load_one_card_file(&path, bank_id) {
+                Ok(result) => {
+                    if !result.cards.is_empty() {
+                        results.push(result);
+                    }
+                }
+                Err(e) => issues.push(LoadIssue {
+                    source_id: ID.to_string(),
+                    path: path.clone(),
+                    message: e.to_string(),
+                }),
             }
         }
 
         results.sort_by(|a, b| a.bank_id.cmp(&b.bank_id));
-        Ok(results)
+        Ok(LoadOutcome { results, issues })
     }
 }
 
@@ -147,6 +165,10 @@ fn load_one_card_file(path: &Path, bank_id: BankId) -> Result<LoadResult, Engine
         serde_json::from_slice(&bytes).map_err(|e| EngineError::json(path, e))?;
 
     let mut cards = Vec::new();
+    // id 去重:同一个文件里 `num` 可能重复(实测真实数据 1278 张卡片里有 110 组重复),
+    // 旧实现按 `<bank>-<num>` 直接生成 id → 同名卡片在 `card` 表被 `INSERT OR REPLACE`
+    // 静默顶掉(实测丢 230 张)。这里保证**文件内 id 唯一**。
+    let mut used_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (idx, raw_card) in raw.questions.into_iter().enumerate() {
         let q = raw_card.q.unwrap_or_default();
         let a = raw_card.a.unwrap_or_default();
@@ -174,11 +196,18 @@ fn load_one_card_file(path: &Path, bank_id: BankId) -> Result<LoadResult, Engine
             }
         }
 
-        // id: <bank>-<num or idx> 保持稳定(同一文件多次载入不变)
-        let id = match raw_card.num {
+        // id: <bank>-<num or idx> 保持稳定(同一文件多次载入不变);
+        // 重名时追加序号,保证文件内唯一(见上面的 used_ids)。
+        let base = match raw_card.num {
             Some(n) => format!("{}-{}", bank_id.0, n),
             None => format!("{}-{}", bank_id.0, idx),
         };
+        let mut id = base.clone();
+        let mut dup = 1;
+        while !used_ids.insert(id.clone()) {
+            id = format!("{base}-{dup}");
+            dup += 1;
+        }
 
         cards.push(CardItem {
             id,
@@ -216,8 +245,7 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos();
-                let path = std::env::temp_dir()
-                    .join(format!("{}-{}-{}", prefix, pid, nanos));
+                let path = std::env::temp_dir().join(format!("{}-{}-{}", prefix, pid, nanos));
                 std::fs::create_dir_all(&path)?;
                 Ok(Self(path))
             }
@@ -271,11 +299,7 @@ mod tests {
         )
         .unwrap();
         // 3) .bak 后缀跳过
-        std::fs::write(
-            crawl.join("示例-问答.json.bak"),
-            r#"{"questions":[]}"#,
-        )
-        .unwrap();
+        std::fs::write(crawl.join("示例-问答.json.bak"), r#"{"questions":[]}"#).unwrap();
         // 4) 全空 q+a 的记录应被跳过
         std::fs::write(
             crawl.join("部分空-问答.json"),
@@ -299,6 +323,37 @@ mod tests {
         assert!(s.display_name().contains("问答"));
     }
 
+    /// P1-1 回归:同一文件里 `num` 重复时,卡片 id 必须唯一。
+    ///
+    /// 修复前:id 直接按 `<bank>-<num>` 生成 → 同名卡片在 `card` 表被
+    /// `INSERT OR REPLACE` 静默顶掉(实测真实数据 1278 张卡片丢了 230 张),
+    /// 而 `card_fts` 不去重 → 行数不等 → join 扇出。
+    #[test]
+    fn duplicate_num_in_same_file_yields_unique_card_ids() {
+        let dir = tempdir::TempDir::new("exam-engine-crawl-dup").unwrap();
+        let crawl = dir.path().join("crawl");
+        std::fs::create_dir_all(&crawl).unwrap();
+        std::fs::write(
+            crawl.join("重复-问答.json"),
+            r#"{
+                "questions": [
+                    {"num": 1, "q": "问一", "a": "答一"},
+                    {"num": 1, "q": "问二", "a": "答二"},
+                    {"num": 2, "q": "问三", "a": "答三"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let results = CrawlCardsSource.load(dir.path()).unwrap().results;
+        let cards = &results[0].cards;
+        assert_eq!(cards.len(), 3, "3 张卡片都要保留");
+        let mut ids: Vec<&str> = cards.iter().map(|c| c.id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "文件内卡片 id 必须唯一(不能被 REPLACE 顶掉)");
+    }
+
     #[test]
     fn source_interval_is_slow() {
         let s = CrawlCardsSource;
@@ -308,7 +363,7 @@ mod tests {
     #[test]
     fn load_finds_two_banks_skips_extras() {
         let tmp = fixture_dir();
-        let results = CrawlCardsSource.load(tmp.path()).unwrap();
+        let results = CrawlCardsSource.load(tmp.path()).unwrap().results;
         assert_eq!(results.len(), 2, "示例 + 部分空");
         let names: Vec<&str> = results.iter().map(|r| r.bank_id.as_str()).collect();
         assert_eq!(names, vec!["示例-问答", "部分空-问答"]);
@@ -317,7 +372,7 @@ mod tests {
     #[test]
     fn load_parses_card_fields() {
         let tmp = fixture_dir();
-        let results = CrawlCardsSource.load(tmp.path()).unwrap();
+        let results = CrawlCardsSource.load(tmp.path()).unwrap().results;
         let bank = &results[0]; // 示例-问答
         assert_eq!(bank.questions.len(), 0, "问答 source 不产 Question");
         assert_eq!(bank.cards.len(), 2);
@@ -332,7 +387,7 @@ mod tests {
     #[test]
     fn load_skips_blank_q_and_a() {
         let tmp = fixture_dir();
-        let results = CrawlCardsSource.load(tmp.path()).unwrap();
+        let results = CrawlCardsSource.load(tmp.path()).unwrap().results;
         let bank = results
             .iter()
             .find(|r| r.bank_id.as_str() == "部分空-问答")
@@ -352,7 +407,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = CrawlCardsSource.load(tmp.path()).unwrap();
+        let results = CrawlCardsSource.load(tmp.path()).unwrap().results;
         assert_eq!(results[0].cards[0].id, "无num-问答-0");
     }
 

@@ -11,10 +11,10 @@
 | 维度 | 数值 |
 |---|---|
 | Crates | engine (lib) + app (bin, Dioxus) + cli (bin) |
-| Tests | **129 passed** (91 → 112 audit +9 → 121 watcher +2 → 123 watcher-restart +4 → 127 backoff +2 → 129 ssr,2026-10-12) |
-| Lint | cargo clippy --all-targets -- -D warnings exit 0(0 errors) |
+| Tests | **173 passed** (engine 150 + app 23 + cli 0)— 历史:91 → 112 audit +9 → 121 watcher +2 → 123 watcher-restart +4 → 127 backoff +2 → 129 ssr(2026-10-12)→ 153 审计修复轮 +24(2026-11-04)→ **173 门禁真接线 +20**(2026-11-04) |
+| Lint | cargo clippy --workspace --all-targets -- -D warnings exit 0(0 errors) |
 | Build | cargo build --workspace exit 0 |
-| 真实数据 E2E | 21 banks / 1760 Q / 1278 cards / rebuild 0.37s |
+| 真实数据 E2E | Rust 索引 **22 banks / 1768 Q / 1278 cards / 0 errors**;Python `json_banks` 侧 17 banks / 1768 Q → 题目级 parity **0/1768(0.00%)** |
 
 ## 已落档阶段
 
@@ -29,8 +29,10 @@ I+++ notify watcher 模块 · J 首启动 UX + 快捷键 · K 三篇 doc ·
 **O 2026-10-12 watcher.rs test 5 unused_mut 清理(clippy --all-targets 0 error)** ·
 **P 2026-10-12 SettingsPage dioxus-ssr 结构化 render test(防 UI 回归)** ·
 **Q 2026-10-12 dump_parity.sh 实际生成 — 1760 Q 0.00% diff(R-015)**
+**R 2026-11-04 审计修复轮 — 9 项 P0/P1/P2 修复落地(P0-1/P0-2/P1-1/P1-2/P1-3/P1-4/P2-3/P2-7 + 文档对齐 P2-5)→ 153 tests**
+**S 2026-11-04 门禁真接线 — perf 预算门禁真断言 + CI workflow(fmt/clippy/test/perf)+ 仓库卫生 + RETURNING 回归修复 + GUI 手工烟测 → 173 tests**
 
-报表:`docs/reports/R-001..R-015` + `R-COVERAGE.md` + `R-PERF.md` + **`docs/plans/2026-10-12-audit-fix.md`** + **`docs/plans/2026-10-12-watcher-integration.md`**
+报表:`docs/reports/R-001..R-013` + `R-015` + **`R-016`(2026-11-04 全量代码审计,末尾附 GUI 手工烟测记录)**(**无 R-014**) + `R-COVERAGE.md` + `R-PERF.md` + `R-FINAL.md` + **`docs/plans/2026-10-12-audit-fix.md`** + **`docs/plans/2026-10-12-watcher-integration.md`**
 设计:`docs/architecture.md` + `docs/port-from-python.md` + `docs/engine-design.md`
 
 ## 关键文件
@@ -44,16 +46,32 @@ crates/exam-engine/src/scheduler.rs    — Arc<Mutex<CacheStore>>(thread-safe)
 crates/exam-engine/src/watcher.rs      — notify 文件 watcher (I+++)
 crates/exam-engine/src/parse.rs        — cjk_expand + norm
 crates/exam-engine/src/source/         — inventory 自动注册 + load_json_bounded
-crates/exam-engine/benches/perf.rs     — divan 6 gates
+crates/exam-engine/src/perf_budget.rs  — perf 预算阈值 + 门禁判定(Phase S;阈值从 Markdown 搬进代码)
+crates/exam-engine/benches/perf.rs     — divan 6 gates + **真断言**(Phase S:此前零断言)
 crates/exam-engine/examples/smoke_realdata.rs — 真实数据 smoke
 crates/exam-app/src/state.rs           — AppState (db + signals)
 crates/exam-app/src/ui/settings.rs     — 数据根 + 主题 + DB 徽章
+.github/workflows/ci.yml             — CI: engine(ubuntu) fmt/clippy/test + app(macos) clippy/test + perf gate(ubuntu)
+rust-toolchain.toml                   — 锁 1.99.1(rustfmt 漂移会让 fmt 门禁在无关 PR 上变红)
+docs/platform-training-docs.md        — 平台培训文档清单(人读);.json 同名(机器可读) ⚠ 未入库,只在主 checkout 工作区
 ```
+
+## 2026-10-26 平台培训文档清单(新增资料源)
+
+**数据源**:知学云 `kc.zhixueyun.com` 本人账号「我的学习」—— 223 门课程 / 229 个文档 / 合计约 1.29 GB
+**产物**:`docs/platform-training-docs.md`(按专业分组的清单)+ `docs/platform-training-docs.json`(机器可读)
+**抓取**:`zhixueyun-kc-video` 技能新增 `scripts/kc_docs_collect.py`(`preview-new` → 公开 CDN `/document/<hash>.<ext>`,GET 免鉴权)
+**口径**:专业分类是按文件名+课程名关键词打分,属本仓库整理口径,非平台官方分类
+**未做**:不下载正文、不入库(清单只给地址);若要进 FTS 索引,下一步是把 pdf/docx 转文本后走既有 source 注册
+
+> ⚠ **2026-11-05 补记**:这一节(以及产物 `docs/platform-training-docs.*`)是 2026-10-26 在**主 checkout 的工作区**里写的,
+> **当时没提交** —— 所以本分支(以及 `main` 的已提交历史)里一直查不到。现已把记录并回本文件;
+> 产物文件本身仍只在主 checkout 的工作区,未入库(见「主 checkout 未提交改动」一节)。
 
 ## 2026-10-12 Audit Round 摘要
 
 3 reviewer 并行 (correctness / security / quality) → 12 fix steps 落地,见 `docs/plans/2026-10-12-audit-fix.md`。
-**PR**:#1 OPEN @ `audit-fix-2026-10-12` branch(commits `2403a7d` fix + `6b597ac` docs + `cb06828` handoff)。
+**PR**:#1 **已合并**(`c06aca2`)。
 **Author**:hgxszhj-pixel(本机 git user.name,只影响本 repo 不动 global)。
 
 修复总览:P0 unsafe Sync → Mutex;P1 caps(query 4096B / JSON 64MiB / data_root canonicalize);P1 observability(tracing + spans);P3 test coverage(cjk_expand / watcher / rebuild)。
@@ -136,17 +154,193 @@ crates/exam-app/src/ui/settings.rs     — 数据根 + 主题 + DB 徽章
 
 **收口**:差异来源已记录,无需修代码(改任一方都是过度工程)。Report:`docs/reports/R-015-dump-parity.md`。
 
+> ⚠ **2026-11-04 修正**:上面 "diff:6 行 ≈ 0.00%" 的**判据是坏的** —— 分母用 `wc -l` 行数,而两个 dump 都是单行 JSON → 分母 0 → 差异率恒为 0.00%(假绿门禁)。P0-2 已把分母改成题目条数,同日重跑真实数据:**0/1768 不一致(0.00%)**,并加了门禁自测证明它能变红。详见 R-015。
+
+## 2026-10-26 资料库改 SQLite 主库(Python 侧)
+
+- 决策与实测:`~/x_videos-dowloads/exam-lookup/DATA_FORMAT.md`
+- 主库:`exam-lookup/jr/out/docs.sqlite`(13.6 MB,schema v1,187 条清单 / 177 条有正文 / 2,772 chunk)
+- 冷启动 531 ms → 6 ms,增量更新 整库重建 → 32 ms/篇,答题准确率同语料下不变(43/62)
+- 快照导出口:`exam-lookup/jr/out/docs_export.json`(带 schema_version);`docs/platform-training-docs.*` 仍是人读/Rust 侧清单,本次未覆盖
+- 本仓库无代码依赖该清单(`grep` 仅命中 docs 与 HANDOFF),无需改动
+
+> ⚠ **2026-11-05 补记**:同样是在主 checkout 工作区写的、**当时没提交**,本分支与 `main` 的已提交历史里都没有。
+> 现已并回本文件。内容本身是 **Python 侧仓库**(`~/x_videos-dowloads/exam-lookup`)的状态,不在本仓 Rust 代码里。
+
+## 2026-11-04 审计修复轮(Phase R)
+
+**来源**:代码审计报告 R-016 —— 已归档进仓 `docs/reports/R-016-code-audit-2026-11-04.md`(仓外副本 `~/develop_software/exam-lookup-rs-audit-2026-11-04.md`)。
+**分支**:`worktree-audit-fix-2026-11-04`(worktree 隔离,未合 main)。
+**结果**:129 → **153 tests**(engine 130 / app 23 / cli 0),clippy 0 error,fmt clean,真实数据 parity 0.00%。
+
+| # | 修复 | 根因 → 修法 |
+|---|---|---|
+| P0-1 | 宽容反序列化 + per-file 隔离 | `answerText` 类型不同 → 整个 bank 反序列化失败 → `Option` 宽容解析 + 单文件失败不拖垮整 bank |
+| P0-2 | parity 门禁分母修正 | 分母用 `wc -l` 行数(两个 dump 都是单行 JSON → 分母 0 → 恒 0.00% 假绿)→ 改题目级比较,分母 = 题目条数;新增门禁自测(能变红) |
+| P1-1 | `q_fts` 扇出 + 跨 bank 同 id 丢题 | FTS 触发词多行 + `q.id` 主键跨 bank 撞 id → `q_fts` 去重 + id 加 bank 前缀 |
+| P1-2 | LIKE 转义失效 | `LIKE` 未带 `ESCAPE` → `%`/`_` 语义被吃 → 补 `ESCAPE '\'` 并让测试真的验证 SQL(旧测试查的是常量,不是行为) |
+| P1-3 | watcher 代际隔离 + 真正 join | 共享 stop flag → 新代 `store(true)` 复活旧代,旧代用**旧 data_root** 重建覆盖新索引 → 每代专属 flag + `stop_watcher` 真正 `join()`(旧代码只 `take()` 句柄 = detach) |
+| P1-4 | 重建索引移出 UI 线程 | 同步重建 → 窗口冻结,且 `rebuilding.set(true)` 与 `set(false)` 之间无让出点 → "重建中…" 永远渲染不出来 → 重建搬到后台 OS 线程,结果经 `futures_channel::oneshot` 回 UI 线程再更新 signal |
+| P2-3 | DB 迁移路径 | 无 `user_version` → schema 变更无迁移通道 → 加 `user_version` + 迁移脚本 |
+| P2-7 | cache status 按读取时刻计算 | 存的 `status` 是**写时**值 → 读出来永远"新鲜" → 读取时按 age 重算(但保留写时的 `Expired` 失败标记) |
+| P2-5 | 文档数字对齐 | README/HANDOFF/报表的测试数、bank 数、source 数、Dioxus 版本、Phase 序号全漂 → 全部对齐实测值 |
+
+**踩坑**:
+- `dioxus::spawn` **不存在** —— `spawn` 在 `dioxus::prelude`(`dioxus_core` 导出);且 Dioxus desktop 的 executor 就是主线程,光用 `dioxus::prelude::spawn` 照样卡 UI → 阻塞活儿必须走 `std::thread`。
+- `Signal<T>` 默认 `UnsyncStorage`(非 `Send`/`Sync`)→ 跨线程回写 signal 会编译失败;用 oneshot 把结果送回 UI 线程再 `set`。
+- cache status 重算一度把 scheduler 的**失败标记**一起洗掉(`tick` 失败时写 `status=Expired`)。判别依据:成功加载恒写 `Fresh`(`compute_status(now, ttl, now)` → age 0 < ttl;所有 `Interval` 的 ttl ≥ 1s),所以"存储值是 `Expired`" ⇔ "上次加载失败",保留不动。
+
+## 2026-11-04 Phase S:门禁真接线(perf 门禁 / CI workflow / 仓库卫生 / GUI 烟测)
+
+**来源**:R-016 审计的 P2 章。上一轮(Phase R)落了 10 项修复,但**门禁本身**仍是纸面上的 ——
+`docs/reports/R-PERF.md` 里写的"Perf 预算超过即触发 CI failure"指向一个**根本不存在的 CI**。
+
+**分支**:`worktree-audit-fix-2026-11-04`(**PR #2,OPEN**)
+**结果**:153 → **173 tests**(engine 150 / app 23 / cli 0),clippy 0 error,fmt clean,真实数据 parity 0.00%。
+
+| 项 | 根因 → 修法 |
+|---|---|
+| RETURNING 回归 | `INSERT ... ON CONFLICT DO UPDATE ... RETURNING rowid` 让 upsert **慢 3 倍**(400 行 fixture:22.3 ms → 7.0 ms)→ 去掉 `RETURNING`,改 `SELECT rowid FROM q WHERE src = ? AND id = ?`(走 `sqlite_autoindex_q_1`) |
+| P2-6 perf 门禁 | 6 个 bench **零断言**,阈值只活在 Markdown → 阈值搬进 `crates/exam-engine/src/perf_budget.rs`;门禁与 bench **共用同一组函数**(否则门禁量的不是 bench 声称的那条路径) |
+| P2-10 仓库卫生 | `.omc/` 等本地产物没进 `.gitignore` → 补上 |
+| CI workflow | 门禁全靠人手动跑 → `.github/workflows/ci.yml`:engine(ubuntu) fmt/clippy/test + app(macos) clippy/test + perf gate(ubuntu)。parity 门禁**故意不在 CI 里**(它要外部 Python 仓库 `~/x_videos-dowloads/exam-lookup`,runner 上没有) |
+| GUI 手工烟测 | P1-3/P1-4 只有真机能验 → 240,000 题合成语料下实跑三条断言,记录进 R-016 末尾 |
+
+**踩坑**:
+- **divan 会吞 panic** —— divan 0.1.21 在 `thread_pool.rs::broadcast_task` 里 `catch_unwind` 掉 bench 函数的 panic,把 catch 到的 `Err` **直接 drop**,进程退出码**仍然是 0**。门禁**绝不能 panic**,必须用失败标志 + `std::process::exit(1)`。
+- **统计量取 P25 不是 median** —— median 在忙机上批次间摆 ±40~60%,P25 只摆 ±3% → 阈值必须给批次间漂移留余量。
+- **CI runner 比开发机慢** —— perf 门禁用 `EXAM_PERF_BUDGET_SCALE=3` 统一放宽 3 倍;非法值退回 1.0(缩放坏了不会让门禁失效)。
+- **`rust-toolchain.toml` 锁 1.99.1** —— rustfmt 版本漂移会让 fmt 门禁在**无关 PR** 上变红,那比没有门禁更坏。
+
+### GUI 手工烟测(唯一只有真机能验的一层)
+
+P1-3 / P1-4 覆盖不到线程调度与渲染时序,必须人工过。语料要**放大** ——
+真实语料只有 1,768 题、重建不到 1 秒,"重建中…"**根本来不及渲染**;
+本轮用 **121 题库 / 240,000 题 / 120,000 卡片(141 MB)** 合成语料。
+
+| 断言 | 结果 |
+|---|---|
+| 手动重建时按钮显示"重建中…" | ✅ 按钮文案变"重建中…"且置灰禁用,状态段同步显示 |
+| 窗口不冻结 | ✅ 重建进行中切「Cards」页正常渲染 |
+| watcher 启停不卡 UI | ✅ 见下 |
+
+**watcher 启停的关键证据**:关开关那条路径 `stop_watcher()` → `join()` 消费线程;若消费线程正在重建,
+`join()` 会**阻塞到重建结束**。所以必须**在重建进行中**去关,才验得出 UI 有没有被拖住:
+
+| 时刻 | 事件 |
+|---|---|
+| 23:08:32.581 | watcher 消费线程启动 |
+| 23:08:54 | `touch` 语料文件 → 触发重建(跑了 33 秒) |
+| ~23:08:57 | 点关 watcher → **UI 立刻**重绘成"未启用 — 需手动点「重建索引」";同一帧设置页显示 **"DB 未加载"**(= 重建进行中的标记) |
+| 23:09:27.162 | 重建完成 |
+| 23:09:27.184 | 消费线程退出(`join()` 在重建结束后 22 ms 返回) |
+
+**UI 响应比消费线程真正退出早了 30 秒** → `join()` 阻塞的是**后台线程**,UI 线程全程没被拖住。
+
+**附带发现(未修)**:重建期间顶部 DB 徽章显示旧题数 —— `ui/shell.rs:12` 的 `db_status_snapshot()`
+每次渲染取一次快照,而 `rebuild_index` 一开始就把 `db_status` 置为 `Unloaded`
+→ 徽章与设置页数字短暂不一致(重建结束后收敛)。表现层问题,不影响索引正确性。
+
+### ⚠️ CI workflow commit 推不上去(需人工一步)
+
+CI workflow commit(`git log --oneline -1`,subject 是 `ci: 加 CI workflow …`)在本机 keychain 的
+`hgxszhj-pixel` OAuth token 下**推不动**:
+
+```
+! [remote rejected] HEAD -> worktree-audit-fix-2026-11-04 (refusing to allow an OAuth App to
+create or update workflow '.github/workflows/ci.yml' without 'workflow' scope)
+```
+
+token **缺 `workflow` scope**。GitHub 按**推的树内容**判定 → **调换 commit 顺序也躲不掉**:
+只要**要推的那个 commit 的树里**含 `.github/workflows/*.yml`,整个 push 都被拒(不是只拒那一个文件)。
+所以只有两条路:
+
+- **排到最后推**:workflow commit 之前的所有 commit 都先推完(它们的树里没有 workflow),
+  workflow commit 单独留着 —— 本轮就是这么排的;
+- **或者先补 scope**:`gh auth refresh -h github.com -s workflow` 之后,
+  workflow commit 排在哪儿都能推,不用再折腾顺序。
+
+解根因需要**人工浏览器授权**:
+
+```bash
+gh auth refresh -h github.com -s workflow
+git push
+```
+
+(SSH key 认证到的是**另一个** GitHub 账号 `hgxszhj`,对本仓库无写权限 —— 换 SSH 没用。)
+
+## 主 checkout 未提交改动(2026-11-05 实测)
+
+**位置**:`/Users/hgxszhj/develop_software/exam-lookup-rs`(分支 `main`,HEAD = `c06aca2` = PR #1 合并点)
+**状态**:`git status --porcelain` → **28 个已改 + 3 个未跟踪**
+
+⚠️ **一句话:审计工作一件都不在这里。** 主 checkout 装的是**审计前**的代码;
+本轮 9 项 P0/P1/P2 修复全部只在本分支上。主 checkout 的"脏"是**排版 + 依赖漂移 + 交接文档**。
+
+### 28 个已改文件 = 三类,没有第四类
+
+| 类 | 文件 | 是什么 | 证据 |
+|---|---|---|---|
+| rustfmt 重排 | 26 个 `.rs` | 有人/某次会话在主 checkout 跑了 `cargo fmt`,把 main HEAD 的旧排版改成当前 rustfmt 的排版(`use` 排序、struct literal 展开、签名换行) | **决定性证据**:把 main HEAD 干净检出到临时目录跑 `cargo fmt` 后,产物与主 checkout 工作区的 26 个 `.rs` 文件**逐字节完全相同(26/26)** —— 即工作区 ≡ `rustfmt(main HEAD)`,**零语义改动** |
+| Cargo.lock 依赖漂移 | `Cargo.lock` | +21 行:新增 `askama_escape 0.13.0`、`dioxus-ssr 0.7.10`(dioxus 0.7.10 的 ssr feature 传递依赖);`Cargo.toml` 的版本声明没动 | `git diff main -- Cargo.lock` 只增两个 `[[package]]` 块 |
+| 交接文档 | `HANDOFF.md` | +17 行 = 上面两节 2026-10-26 记录(已并回本文件,见两处 ⚠ 补记) | — |
+
+**方向别搞反**:这份 rustfmt 改动**不是垃圾** —— 它把 main 从「fmt 不合规」修成「合规」:
+main HEAD 干净检出跑 `cargo fmt --all -- --check` → **exit 1(73 处 diff)**;
+主 checkout 工作区跑同一命令 → **exit 0**。而且排版风格与本分支一致
+(例 `upsert_meta(&self.conn, "last_rebuild_at", &now_iso8601())?;` 单行,本分支同为单行)。
+但它**合并时挡路**,且内容会被分支版本整体替换 → **合并前丢掉**(见处置顺序)。
+
+### 审计工作不在主 checkout 的反证
+
+| 文件 | 主 checkout 工作区 | main HEAD | 本分支 |
+|---|---|---|---|
+| `crates/exam-engine/src/index.rs` | 616 行 | 600 行 | **1564 行** |
+| `crates/exam-app/src/state.rs` | generation / AtomicBool 痕迹 **4 处** | — | **11 处**(P1-3 watcher 隔离) |
+| `crates/exam-app/src/settings.rs` | `futures_channel` / `oneshot` **0 处** | — | **2 处**(P1-4 后台线程重建) |
+| `Cargo.lock` | **无** `futures-channel` | 同左 | **有** |
+
+28 个文件里 **12 个与本分支完全一致** —— 因为审计轮压根没碰它们;
+另外 16 个不同,差异**全部**落在上面三类里。
+
+### 3 个未跟踪
+
+| 路径 | 大小 | 处置 |
+|---|---|---|
+| `docs/platform-training-docs.md` | 49,863 B | **要救** —— 主 checkout 独有的产物,全仓库历史里从没提交过 |
+| `docs/platform-training-docs.json` | 121,267 B | 同上 |
+| `.omc/` | 4 KB × 2 | 不用管 —— 本分支 `.gitignore` 第 14 行已忽略 `.omc/`,合并后自动消失 |
+
+### 处置顺序(不能反)
+
+1. **先合 PR #2**,再处理主 checkout。反过来必卡:main 这 28 个本地改动与合并进来的文件重叠,
+   `git merge` 会直接拒绝(`Your local changes to the following files would be overwritten by merge`)。
+2. 合并前在主 checkout `git checkout -- .` —— 丢掉 fmt 重排 + Cargo.lock 漂移 + HANDOFF 旧版。
+   分支版本**已经是** fmt 合规、且带着审计要的 `futures-channel`,这 28 个文件的内容会被整体替换。
+   HANDOFF 的 2026-10-26 两节已在合并内容里,不会丢。
+3. `docs/platform-training-docs.{md,json}` 单独一次提交 rescue —— 合并前后都安全
+   (分支不含这两个路径,merge 不会覆盖;untracked 也不挡 merge)。建议合并完再做。
+
 ## 下次会话候选
 
-(空 — 全部落档,branch 可合 main)
+- **合并本轮**:branch `worktree-audit-fix-2026-11-04` → main(**PR #2**,https://github.com/hgxszhj-pixel/exam-lookup-rs/pull/2)。
+  合并前先解掉 CI workflow commit 的 token 阻塞:`gh auth refresh -h github.com -s workflow` → `git push`。
+- **主 checkout 的 28 个脏文件**:合并前在主 checkout `git checkout -- .` 丢掉(不丢 merge 会被拒),
+  `docs/platform-training-docs.{md,json}` 单独提交救回来。详见「主 checkout 未提交改动」。
+- **R-004 决策未落地**:若仍要精确锁 `dioxus =0.7.9`,改 `crates/exam-app/Cargo.toml` 的 caret 为 `=0.7.9`(当前实解 0.7.10,代码在其上编译/测试全绿)。
+- **未修的小项**(本轮记录,均不影响正确性):重建期间顶部 DB 徽章显示旧题数(`ui/shell.rs:12` 每次渲染取快照 vs `rebuild_index` 先置 `Unloaded`)。
+- **门禁仍未全覆盖**:parity 门禁需外部 Python 仓库,进不了 CI;`exam-cli` 仍**零单测**。
 
 ## 验收命令
 
 ```bash
 cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
+cargo test --workspace                                    # 173 passed (engine 150 / app 23 / cli 0)
+cargo clippy --workspace --all-targets -- -D warnings    # 0 error
+cargo fmt --all -- --check                               # clean
 cargo run --package exam-engine --example smoke_realdata
+# perf 预算门禁(Phase S;CI 里带 EXAM_PERF_BUDGET_SCALE=3)
+cargo bench --locked -p exam-engine --bench perf -- --sample-size 10
 # CLI smoke
 cargo run --bin exam-cli -- load --source json_banks --data-root /tmp/nonexistent_xxx
 cargo run --bin exam-cli -- load --source json_banks --data-root /tmp/.
